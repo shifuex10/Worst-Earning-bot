@@ -224,6 +224,11 @@ def registered_keyboard():
         [_kb("Cancel ❌", "danger")],
     ], resize_keyboard=True)
 
+def cancel_keyboard():
+    return ReplyKeyboardMarkup([
+        [_kb("Cancel ❌", "danger")],
+    ], resize_keyboard=True)
+
 def lang_keyboard():
     return ReplyKeyboardMarkup([
         [_kb("Bangla 🇧🇩", "success"), _kb("🇺🇸 English", "primary")],
@@ -239,12 +244,6 @@ def review_keyboard(idx, acc_type):
             _ikb("◀️ Previous", callback_data=f"prev_{acc_type}_{idx}", style="primary"),
             _ikb("Next 🔥", callback_data=f"next_{acc_type}_{idx}", style="primary"),
         ],
-    ])
-
-def withdraw_confirm_keyboard():
-    return InlineKeyboardMarkup([
-        [_ikb("✅ Confirm", callback_data="wd_confirm", style="success"),
-         _ikb("❌ Cancel", callback_data="wd_cancel", style="danger")],
     ])
 
 # ─────────────────────────────────────────
@@ -390,12 +389,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif text == "👤 Profile":
         user = update.effective_user
         uname = f"@{user.username}" if user.username else "N/A"
+        bal = get_balance(uid)
         await update.message.reply_text(
-            f"👤 *প্রোফাইল*\n\n"
+            f"👤 প্রোফাইল\n\n"
             f"📛 নাম: {user.full_name}\n"
             f"🆔 Username: {uname}\n"
-            f"🔢 Chat ID: `{user.id}`",
-            parse_mode="Markdown"
+            f"🔢 Chat ID: {user.id}\n"
+            f"💰 Balance: {bal:.4f}tk"
         )
         return ConversationHandler.END
 
@@ -478,9 +478,8 @@ async def tt_wait_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text == "2FA Set 📐":
         await update.message.reply_text(
             "🔑 এখন আপনার TikTok অ্যাকাউন্টের 2FA Secret Key পাঠান:\n\n"
-            "_(2FA চালু করার সময় যে QR code বা text key পাবেন সেটা)_",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
+            "(2FA চালু করার সময় যে QR code বা text key পাবেন সেটা)",
+            reply_markup=cancel_keyboard()
         )
         return TT_WAIT_2FA
 
@@ -492,17 +491,16 @@ async def tt_wait_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if code == "ERROR":
         await update.message.reply_text(
             "❌ 2FA Key সঠিক নয়! আবার চেষ্টা করুন।\n"
-            "_(সঠিক Base32 secret key দিন)_",
-            parse_mode="Markdown"
+            "(সঠিক Base32 secret key দিন)",
+            reply_markup=cancel_keyboard()
         )
         return TT_WAIT_2FA
 
     await update.message.reply_text(
-        f"✅ আপনার 2FA কোড: `{code}`\n\n"
+        f"✅ আপনার 2FA কোড: {code}\n\n"
         "এই কোডটি TikTok এ দিয়ে 2FA confirm করুন।\n\n"
         "🔔 এরপর যেই ইমেল দিয়ে একাউন্ট করেছেন ওই ইমেল টা দিন ❗",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=cancel_keyboard()
     )
     return TT_WAIT_EMAIL
 
@@ -511,7 +509,8 @@ async def tt_wait_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text == "Cancel ❌":
-        await update.message.reply_text("🏠", reply_markup=home_keyboard())
+        ctx.user_data.clear()
+        await update.message.reply_text("🏠 হোমে ফিরে এসেছেন।", reply_markup=home_keyboard())
         return ConversationHandler.END
 
     ctx.user_data["tt_email"] = text
@@ -567,9 +566,8 @@ async def insta_wait_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text == "2FA Set 📐":
         await update.message.reply_text(
             "🔑 এখন আপনার Instagram অ্যাকাউন্টের 2FA Secret Key পাঠান:\n\n"
-            "_(2FA চালু করার সময় যে QR code বা text key পাবেন সেটা)_",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
+            "(2FA চালু করার সময় যে QR code বা text key পাবেন সেটা)",
+            reply_markup=cancel_keyboard()
         )
         return INSTA_WAIT_2FA
 
@@ -580,14 +578,14 @@ async def insta_wait_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if code == "ERROR":
         await update.message.reply_text(
             "❌ 2FA Key সঠিক নয়! আবার চেষ্টা করুন।",
+            reply_markup=cancel_keyboard()
         )
         return INSTA_WAIT_2FA
 
     await update.message.reply_text(
-        f"✅ আপনার 2FA কোড: `{code}`\n\n"
+        f"✅ আপনার 2FA কোড: {code}\n\n"
         "এই কোডটি Instagram এ দিয়ে 2FA confirm করুন।",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=cancel_keyboard()
     )
 
     # Save to DB
