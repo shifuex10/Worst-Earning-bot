@@ -241,6 +241,12 @@ def review_keyboard(idx, acc_type):
         ],
     ])
 
+def withdraw_confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [_ikb("✅ Confirm", callback_data="wd_confirm", style="success"),
+         _ikb("❌ Cancel", callback_data="wd_cancel", style="danger")],
+    ])
+
 # ─────────────────────────────────────────
 # UTILS
 # ─────────────────────────────────────────
