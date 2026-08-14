@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import logging
+import random
+import string
 import pyotp
 import openpyxl
 from datetime import datetime
@@ -19,8 +21,8 @@ from telegram.ext import (
 # ─────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 CHANNEL_ID = "@worst_bux_bot"
-CHANNEL_LINK = "https://t.me/worst_bux_bot"
-PROXY_LINK = "https://t.me/will_be_eran_shop_bot?start=ref_8907284640"
+CHANNEL_LINK = "[t.me](https://t.me/worst_bux_bot)"
+PROXY_LINK = "[t.me](https://t.me/will_be_eran_shop_bot?start=ref_8907284640)"
 
 SUPERADMIN_ID = 8452827743
 ADMIN_1 = int(os.environ.get("ADMIN_1", "0"))
@@ -107,11 +109,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 );
 
 INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('tt_password', 'demon@15');
-INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('tt_2fa_key', '');
 INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('insta_password', 'Rokon@15');
-INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('insta_2fa_key', '');
-INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('tt_username', 'larryajpy047');
-INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('insta_username', 'larryajpy047');
 """)
 conn.commit()
 
@@ -159,6 +157,22 @@ def gen_totp(secret):
     except Exception as e:
         logger.error(f"TOTP error: {e}")
         return "ERROR"
+
+def gen_username():
+    """Auto-generate an uncommon username with numbers in the middle."""
+    parts = [
+        "wolf", "nova", "zylo", "kori", "raxo", "mint", "luna", "drip",
+        "vexo", "juno", "riko", "zephy", "orbi", "flux", "kylo", "nyra",
+        "quix", "brix", "dazo", "vibr", "ghost", "pyro", "aero", "onyx",
+    ]
+    tails = [
+        "vibe", "wave", "core", "byte", "lite", "zone", "kid", "fox",
+        "boss", "hub", "lab", "pix", "sky", "dew", "ink", "run",
+    ]
+    head = random.choice(parts)
+    tail = random.choice(tails)
+    mid = "".join(random.choices(string.digits, k=random.choice([2, 3])))
+    return f"{head}{mid}{tail}"
 
 # ─────────────────────────────────────────
 # KEYBOARDS
@@ -415,9 +429,10 @@ async def task_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     elif "TikTok" in text:
-        tt_user = get_setting("tt_username")
+        tt_user = gen_username()
         tt_pass = get_setting("tt_password")
         ctx.user_data["task"] = "tiktok"
+        ctx.user_data["tt_username"] = tt_user
         await update.message.reply_text(
             f"`👤 Username: {tt_user}`\n`🔑 Password: {tt_pass}`\n\n"
             "🧾 উপরের ইউজারনেম এবং পাসওয়ার্ড দিয়ে অ্যাকাউন্ট খুলুন।\n"
@@ -428,9 +443,10 @@ async def task_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return TT_WAIT_2FA
 
     elif "Insta" in text:
-        insta_user = get_setting("insta_username")
+        insta_user = gen_username()
         insta_pass = get_setting("insta_password")
         ctx.user_data["task"] = "insta"
+        ctx.user_data["insta_username"] = insta_user
         await update.message.reply_text(
             f"`👤 Username: {insta_user}`\n`🔑 Password: {insta_pass}`\n\n"
             "🧾 উপরের ইউজারনেম এবং পাসওয়ার্ড দিয়ে অ্যাকাউন্ট খুলুন।\n"
@@ -509,7 +525,7 @@ async def tt_wait_registered(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if text == "Account Registered ✅":
-        tt_user = get_setting("tt_username")
+        tt_user = ctx.user_data.get("tt_username", gen_username())
         tt_pass = get_setting("tt_password")
         twofa = ctx.user_data.get("tt_2fa_key", "")
         email = ctx.user_data.get("tt_email", "")
@@ -568,7 +584,7 @@ async def insta_wait_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     # Save to DB
-    insta_user = get_setting("insta_username")
+    insta_user = ctx.user_data.get("insta_username", gen_username())
     insta_pass = get_setting("insta_password")
     cur.execute(
         "INSERT INTO insta_accounts (user_id, username, password, twofa_key, status, created_at) "
@@ -765,40 +781,21 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_pass_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
-    if not args or len(args) < 2:
+    if not args:
         await update.message.reply_text(
-            "🔑 *Password/Settings পরিবর্তন:*\n\n"
-            "`/pass tt <password>` — TikTok password\n"
-            "`/pass insta <password>` — Instagram password\n"
-            "`/pass ttuser <username>` — TikTok username\n"
-            "`/pass instauser <username>` — Instagram username\n"
-            "`/pass tt2fa <secret>` — TikTok 2FA secret\n"
-            "`/pass insta2fa <secret>` — Instagram 2FA secret",
+            "🔑 *Password পরিবর্তন:*\n\n"
+            "`/pass <password>` লিখুন — এটাই TikTok এবং Instagram দুই টাস্কের password হবে।",
             parse_mode="Markdown"
         )
         return
 
-    key_map = {
-        "tt": "tt_password",
-        "insta": "insta_password",
-        "ttuser": "tt_username",
-        "instauser": "insta_username",
-        "tt2fa": "tt_2fa_key",
-        "insta2fa": "insta_2fa_key",
-    }
-    sub = args[0].lower()
-    val = " ".join(args[1:])
-
-    if sub in key_map:
-        set_setting(key_map[sub], val)
-        await update.message.reply_text(
-            f"✅ `{sub}` আপডেট হয়েছে:\n`{val}`",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            "❌ Invalid. Valid keys: tt, insta, ttuser, instauser, tt2fa, insta2fa"
-        )
+    val = " ".join(args)
+    set_setting("tt_password", val)
+    set_setting("insta_password", val)
+    await update.message.reply_text(
+        f"✅ Password আপডেট হয়েছে (TikTok + Instagram):\n`{val}`",
+        parse_mode="Markdown"
+    )
 
 @admin_only
 async def cmd_reviewtt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
