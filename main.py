@@ -270,9 +270,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ensure_user(user)
 
     uname = f"@{user.username}" if user.username else str(user.id)
+    full_name = user.full_name or "Unknown"
     await notify_admins(
         ctx.bot,
-        f"🔔 User Started The Bot\n👤 {user.full_name}\n🆔 {uname}"
+        f"🔔 User Started The Bot\n👤 {full_name}\n🆔 {uname}"
     )
 
     if not BOT_ENABLED:
