@@ -1,3 +1,7 @@
-python-telegram-bot==21.6
-pyotp==2.9.0
-openpyxl==3.1.5
+# No third-party packages required.
+# This bot uses only Python standard library modules:
+#   - json        (built-in)
+#   - urllib      (built-in)
+#   - time        (built-in)
+#
+# Python >= 3.10 recommended (for `dict | None` union type hints)

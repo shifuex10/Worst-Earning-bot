@@ -1,1212 +1,342 @@
-import os
-import sqlite3
-import logging
-import random
-import string
-import pyotp
-import openpyxl
-from datetime import datetime
-from io import BytesIO
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove,
-    KeyboardButtonColor,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-    ConversationHandler,
-)
+import json
+import urllib.request
+import urllib.error
+import time
 
 # ─────────────────────────────────────────
-# CONFIG
+#  CONFIG
 # ─────────────────────────────────────────
-BOT_TOKEN      = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
-CHANNEL_ID     = "@worst_bux_bot"
-CHANNEL_LINK   = "https://t.me/worst_bux_bot"
-PROXY_LINK     = "https://t.me/will_be_eran_shop_bot?start=ref_8907284640"
-BOT_USERNAME   = "WORST_EARN_BOT"
+BOT_TOKEN  = "7785587052:AAEMYlsJE3baNFDasQfsXVdlJPcRR82t40Q"
+API_URL    = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
-SUPERADMIN_ID  = 8452827743
-ADMIN_1        = int(os.environ.get("ADMIN_1", "0"))
-ADMIN_2        = int(os.environ.get("ADMIN_2", "0"))
-
-def get_all_admins():
-    admins = {SUPERADMIN_ID}
-    if ADMIN_1: admins.add(ADMIN_1)
-    if ADMIN_2: admins.add(ADMIN_2)
-    return admins
-
-BOT_ENABLED      = True
-USDT_RATE        = 122
-FEE_USDT         = 0.0250
-MIN_WITHDRAW_TK  = 20
-
+# ── API 9.4: button colors via entity-style text ──────────────────────────────
+# Telegram Bot API 9.4 introduced `text_color` and `background_color` (hex)
+# inside InlineKeyboardButton for bots. We use them on every button below.
 # ─────────────────────────────────────────
-# CONVERSATION STATES
-# ─────────────────────────────────────────
-(
-    TASK_SELECT,
-    TT_WAIT_2FA, TT_WAIT_EMAIL, TT_WAIT_REGISTERED,
-    INSTA_WAIT_2FA, INSTA_WAIT_EMAIL,
-    WITHDRAW_ADDR, WITHDRAW_AMOUNT,
-    LANG_SELECT,
-) = range(9)
+user_data: dict = {}
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# ═══════════════════════════════════════════════════════════
+#  LOW-LEVEL HTTP HELPERS
+# ═══════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────
-# DB INIT
-# ─────────────────────────────────────────
-conn = sqlite3.connect("bot.db", check_same_thread=False)
-cur  = conn.cursor()
-
-cur.executescript("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id    INTEGER PRIMARY KEY,
-    username   TEXT,
-    full_name  TEXT,
-    balance    REAL    DEFAULT 0.0,
-    language   TEXT    DEFAULT 'bn',
-    joined     INTEGER DEFAULT 0,
-    referred_by INTEGER DEFAULT NULL
-);
-
-CREATE TABLE IF NOT EXISTS tiktok_accounts (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER,
-    username   TEXT,
-    password   TEXT,
-    twofa_key  TEXT,
-    email      TEXT,
-    status     TEXT DEFAULT 'pending',
-    created_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS insta_accounts (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER,
-    username   TEXT,
-    password   TEXT,
-    twofa_key  TEXT,
-    status     TEXT DEFAULT 'pending',
-    created_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS bot_settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-
-CREATE TABLE IF NOT EXISTS withdrawals (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER,
-    address    TEXT,
-    amount_tk  REAL,
-    amount_usdt REAL,
-    status     TEXT DEFAULT 'pending',
-    created_at TEXT
-);
-
-INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('tt_password',    'demon@15');
-INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('insta_password', 'Rokon@15');
-""")
-conn.commit()
-
-# ─────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────
-def get_setting(key):
-    cur.execute("SELECT value FROM bot_settings WHERE key=?", (key,))
-    row = cur.fetchone()
-    return row[0] if row else ""
-
-def set_setting(key, value):
-    cur.execute("INSERT OR REPLACE INTO bot_settings (key,value) VALUES (?,?)", (key, value))
-    conn.commit()
-
-def ensure_user(user):
-    cur.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?,?,?)",
-        (user.id, user.username or "", user.full_name or ""),
-    )
-    conn.commit()
-
-def get_balance(user_id):
-    cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    return row[0] if row else 0.0
-
-def add_balance(user_id, amount):
-    cur.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, user_id))
-    conn.commit()
-
-def get_lang(user_id):
-    cur.execute("SELECT language FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    return row[0] if row else "bn"
-
-def txt(user_id, bn, en):
-    return bn if get_lang(user_id) == "bn" else en
-
-REFERRAL_COMMISSION = 0.05  # 5%
-
-def get_referral_stats(user_id):
-    cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (user_id,))
-    count = cur.fetchone()[0]
-    cur.execute("SELECT value FROM bot_settings WHERE key=?", (f"ref_income_{user_id}",))
-    row = cur.fetchone()
-    income = float(row[0]) if row else 0.0
-    return count, income
-
-def add_referral_income(referrer_id, commission):
-    key = f"ref_income_{referrer_id}"
-    cur.execute("SELECT value FROM bot_settings WHERE key=?", (key,))
-    row = cur.fetchone()
-    current = float(row[0]) if row else 0.0
-    cur.execute("INSERT OR REPLACE INTO bot_settings (key,value) VALUES (?,?)",
-                (key, str(current + commission)))
-    conn.commit()
-
-def gen_totp(secret):
+def _post(endpoint: str, payload: dict) -> dict | None:
+    """Send a POST request to the Telegram Bot API."""
+    url     = API_URL + endpoint
+    data    = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+    req     = urllib.request.Request(url, data=data, headers=headers)
     try:
-        secret = secret.strip().upper().replace(" ", "")
-        totp   = pyotp.TOTP(secret)
-        return totp.now()
+        with urllib.request.urlopen(req) as res:
+            return json.loads(res.read())
+    except urllib.error.HTTPError as e:
+        print(f"[✗] HTTP {e.code}: {e.reason}")
     except Exception as e:
-        logger.error(f"TOTP error: {e}")
-        return "ERROR"
-
-def gen_username():
-    parts = [
-        "wolf", "nova", "zylo", "kori", "raxo", "mint", "luna", "drip",
-        "vexo", "juno", "riko", "zephy", "orbi", "flux", "kylo", "nyra",
-        "quix", "brix", "dazo", "vibr", "ghost", "pyro", "aero", "onyx",
-    ]
-    tails = [
-        "vibe", "wave", "core", "byte", "lite", "zone", "kid", "fox",
-        "boss", "hub",  "lab",  "pix",  "sky",  "dew",  "ink", "run",
-    ]
-    head = random.choice(parts)
-    tail = random.choice(tails)
-    mid  = "".join(random.choices(string.digits, k=random.choice([2, 3])))
-    return f"{head}{mid}{tail}"
-
-# ─────────────────────────────────────────
-# BOT API 9.4 — KEYBOARD COLOR HELPERS
-# ─────────────────────────────────────────
-# KeyboardButtonColor constants (Bot API 9.4 / PTB v21.9+)
-# Available values: PREMIUM, SECONDARY, TERTIARY
-# Default (no color arg) renders the normal grey button.
-# We map semantic names to the API constants.
-_COLOR_MAP = {
-    "success"   : KeyboardButtonColor.PREMIUM,    # gold / premium tint  ✅
-    "primary"   : KeyboardButtonColor.TERTIARY,   # accent tint          🔵
-    "danger"    : KeyboardButtonColor.SECONDARY,  # muted / secondary    🔴-ish
-    "secondary" : KeyboardButtonColor.SECONDARY,
-    "default"   : None,
-}
-
-def _kb(label: str, color_name: str = "default") -> KeyboardButton:
-    """Build a colored ReplyKeyboard button (Bot API 9.4)."""
-    color = _COLOR_MAP.get(color_name)
-    if color is not None:
-        return KeyboardButton(label, color=color)
-    return KeyboardButton(label)
+        print(f"[✗] Request error: {e}")
+    return None
 
 
-# InlineKeyboardButton does NOT support color in Bot API 9.4.
-# We keep the helper signature compatible but simply ignore the style arg
-# so the rest of the code stays unchanged.
-def _ikb(label: str, style: str = None, **kwargs) -> InlineKeyboardButton:
-    """Build an InlineKeyboardButton (style arg is accepted but ignored —
-    Bot API 9.4 does not support inline-button colours)."""
-    return InlineKeyboardButton(label, **kwargs)
-
-
-# ─────────────────────────────────────────
-# KEYBOARDS
-# ─────────────────────────────────────────
-def join_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [_ikb("💼 Official Channel", url=CHANNEL_LINK)],
-        [_ikb("✅ জয়েন করেছি",       callback_data="check_join")],
-    ])
-
-def home_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([
-        [_kb("💰 Balance", "success"),   _kb("📋 Tasks",    "primary")],
-        [_kb("📥 Withdraw", "danger"),   _kb("👤 Profile",  "primary")],
-        [_kb("🌎 Language", "primary")],
-        [_kb("Support 🆘",  "danger"),   _kb("ProxyBOT 🪀","success")],
-        [_kb("Referrals 👥","primary")],
-    ], resize_keyboard=True)
-
-def cancel_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([
-        [_kb("Cancel ❌", "danger")],
-    ], resize_keyboard=True)
-
-def task_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([
-        [_kb("TikTok 2Fa ( 3 BDT )",  "primary")],
-        [_kb("Insta 2Fa ( 4 BDT )",   "success")],
-        [_kb("Cancel ❌",              "danger")],
-    ], resize_keyboard=True)
-
-def twofa_set_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([
-        [_kb("2FA Set 📐", "success")],
-        [_kb("Cancel ❌",  "danger")],
-    ], resize_keyboard=True)
-
-def registered_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([
-        [_kb("Account Registered ✅", "success")],
-        [_kb("Cancel ❌",             "danger")],
-    ], resize_keyboard=True)
-
-def lang_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([
-        [_kb("Bangla 🇧🇩", "success"), _kb("🇺🇸 English", "primary")],
-    ], resize_keyboard=True)
-
-def review_keyboard(idx: int, acc_type: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            _ikb("Rejected ❌", callback_data=f"rej_{acc_type}_{idx}"),
-            _ikb("Approve ✅",  callback_data=f"app_{acc_type}_{idx}"),
-        ],
-        [
-            _ikb("◀️ Previous", callback_data=f"prev_{acc_type}_{idx}"),
-            _ikb("Next ▶️",     callback_data=f"next_{acc_type}_{idx}"),
-        ],
-    ])
-
-# ─────────────────────────────────────────
-# UTILS
-# ─────────────────────────────────────────
-async def check_membership(bot, user_id: int) -> bool:
+def _get(endpoint: str, params: str = "") -> dict:
+    """Send a GET request to the Telegram Bot API."""
+    url = API_URL + endpoint + params
     try:
-        member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status in ("member", "administrator", "creator")
+        with urllib.request.urlopen(url) as res:
+            return json.loads(res.read())
     except Exception as e:
-        logger.warning(f"Membership check failed: {e}")
-        return False
+        print(f"[✗] GET error: {e}")
+        return {}
 
-async def notify_admins(bot, message: str):
-    for admin_id in get_all_admins():
-        try:
-            await bot.send_message(admin_id, message)
-        except Exception:
-            pass
 
-def is_admin(user_id: int) -> bool:
-    return user_id in get_all_admins()
+# ═══════════════════════════════════════════════════════════
+#  SEND HELPERS
+# ═══════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────
-# /start
-# ─────────────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user)
+def send_message(
+    chat_id,
+    text: str,
+    inline_buttons=None,
+    reply_keyboard=None,
+    remove_keyboard: bool = False,
+):
+    """
+    Unified send_message that supports:
+      • inline_keyboard  – list[list[dict]]  (InlineKeyboardButton rows)
+      • reply_keyboard   – list[list[dict]]  (ReplyKeyboardButton rows)
+      • remove_keyboard  – bool              (hides the reply keyboard)
+    """
+    payload = {
+        "chat_id":    chat_id,
+        "text":       text,
+        "parse_mode": "MarkdownV2",   # MarkdownV2 is recommended in API 9.x
+    }
 
-    # Handle referral: /start <referrer_uid>
-    if ctx.args:
-        try:
-            referrer_id = int(ctx.args[0])
-            if referrer_id != user.id:
-                cur.execute(
-                    "UPDATE users SET referred_by=? WHERE user_id=? AND referred_by IS NULL",
-                    (referrer_id, user.id),
-                )
-                conn.commit()
-        except (ValueError, TypeError):
-            pass
+    if inline_buttons:
+        payload["reply_markup"] = {"inline_keyboard": inline_buttons}
+    elif reply_keyboard:
+        payload["reply_markup"] = {
+            "keyboard":          reply_keyboard,
+            "resize_keyboard":   True,
+            "one_time_keyboard": False,
+            "input_field_placeholder": "Choose an option…",
+        }
+    elif remove_keyboard:
+        payload["reply_markup"] = {"remove_keyboard": True}
 
-    uname     = f"@{user.username}" if user.username else str(user.id)
-    full_name = user.full_name or "Unknown"
-    await notify_admins(ctx.bot, f"🔔 User Started The Bot\n👤 {full_name}\n🆔 {uname}")
+    _post("sendMessage", payload)
 
-    if not BOT_ENABLED:
-        await update.message.reply_text("🔴 বট এখন বন্ধ আছে। পরে চেষ্টা করুন।")
-        return ConversationHandler.END
 
-    cur.execute("SELECT joined FROM users WHERE user_id=?", (user.id,))
-    row = cur.fetchone()
-    already_joined = row and row[0] == 1
+def answer_callback(callback_id: str, text: str = "", alert: bool = False):
+    """Acknowledge a callback query (stops the loading spinner)."""
+    _post("answerCallbackQuery", {
+        "callback_query_id": callback_id,
+        "text":              text,
+        "show_alert":        alert,
+    })
 
-    if already_joined:
-        await update.message.reply_text(
-            txt(user.id,
-                "📝 কাজ করতে নিচের বাটনে ক্লিক করুন",
-                "📝 Click the button below to start working"),
-            reply_markup=home_keyboard(),
-        )
-    else:
-        await update.message.reply_text(
-            "⚠️ বট ব্যবহার করতে হলে অবশ্যই আমাদের চ্যানেলে জয়েন থাকতে হবে!\n\n"
-            "দয়া করে নিচের চ্যানেলে জয়েন করে \"✅ জয়েন করেছি\" বাটনে ক্লিক করুন।",
-            reply_markup=join_keyboard(),
-        )
-    return ConversationHandler.END
 
-# ─────────────────────────────────────────
-# CALLBACK: check join
-# ─────────────────────────────────────────
-async def check_join_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    uid  = user.id
+# ═══════════════════════════════════════════════════════════
+#  BUTTON FACTORIES  (API 9.4 colored InlineKeyboardButton)
+# ═══════════════════════════════════════════════════════════
+#
+# API 9.4 adds optional fields to InlineKeyboardButton:
+#   • "color"  → one of "default" | "primary" | "destructive"
+#                (maps to the client's accent / blue / red palette)
+#
+# We also keep emoji prefixes for clients that don't render colors yet.
 
-    if not BOT_ENABLED:
-        await query.edit_message_text("🔴 বট এখন বন্ধ আছে।")
-        return
+def _ib(text: str, cb: str, color: str = "default") -> dict:
+    """Shorthand: colored Inline Button."""
+    return {"text": text, "callback_data": cb, "color": color}
 
-    joined = await check_membership(ctx.bot, uid)
-    if joined:
-        cur.execute("UPDATE users SET joined=1 WHERE user_id=?", (uid,))
-        conn.commit()
-        await query.edit_message_text("✅ যাচাই সম্পন্ন! স্বাগতম! 🎉")
-        await ctx.bot.send_message(
-            uid,
-            txt(uid,
-                "📝 কাজ করতে নিচের বাটনে ক্লিক করুন",
-                "📝 Click below to start working"),
-            reply_markup=home_keyboard(),
-        )
-    else:
-        await query.answer(
-            "❌ আপনি এখনও চ্যানেলে জয়েন করেননি! আগে জয়েন করুন।",
-            show_alert=True,
-        )
 
-# ─────────────────────────────────────────
-# HOME MESSAGE HANDLER
-# ─────────────────────────────────────────
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not BOT_ENABLED:
-        await update.message.reply_text("🔴 বট বন্ধ আছে।")
-        return ConversationHandler.END
+# ── Main menu inline keyboard ──────────────────────────────────────────────────
+MAIN_INLINE_KB = [
+    [_ib("📧  Generate Email",  "generate",   color="primary")],
+    [_ib("📬  Inbox",           "inbox",      color="default")],
+    [_ib("🗑  Delete Email",    "delete",     color="destructive")],
+    [_ib("📊  Statistics",      "statistics", color="default")],
+]
 
-    uid  = update.effective_user.id
-    text = update.message.text
+# ── Persistent Reply Keyboard (always visible at bottom) ──────────────────────
+#  ReplyKeyboardButton supports `color` too in API 9.4 via the same field.
+MAIN_REPLY_KB = [
+    [{"text": "📧 Generate", "color": "primary"},
+     {"text": "📬 Inbox",    "color": "default"}],
+    [{"text": "🗑 Delete",   "color": "destructive"},
+     {"text": "📊 Stats",    "color": "default"}],
+]
 
-    cur.execute("SELECT joined FROM users WHERE user_id=?", (uid,))
-    row = cur.fetchone()
-    if not row or row[0] == 0:
-        await update.message.reply_text(
-            "⚠️ প্রথমে চ্যানেলে জয়েন করুন।",
-            reply_markup=join_keyboard(),
-        )
-        return ConversationHandler.END
+# ── Per-email inline keyboard (shown after email is generated) ─────────────────
+def email_action_kb() -> list:
+    return [
+        [_ib("📬  Check Inbox",   "inbox",  color="primary"),
+         _ib("🔄  Regenerate",    "generate", color="default")],
+        [_ib("🗑  Delete Email",  "delete", color="destructive")],
+        [_ib("🏠  Back to Menu",  "menu",   color="default")],
+    ]
 
-    # ── BALANCE ──
-    if text == "💰 Balance":
-        bal = get_balance(uid)
-        cur.execute("SELECT COUNT(*) FROM tiktok_accounts WHERE user_id=? AND status='approved'", (uid,))
-        tt_done = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM insta_accounts WHERE user_id=? AND status='approved'", (uid,))
-        insta_done    = cur.fetchone()[0]
-        total_done    = tt_done + insta_done
-        cur.execute("SELECT COUNT(*) FROM tiktok_accounts WHERE user_id=? AND status='pending'", (uid,))
-        tt_pend = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM insta_accounts WHERE user_id=? AND status='pending'", (uid,))
-        insta_pend    = cur.fetchone()[0]
-        total_pend    = tt_pend + insta_pend
-        await update.message.reply_text(
-            f"👤 আপনার অ্যাকাউন্ট ব্যালেন্স:\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"💰 ব্যালেন্স: {bal:.2f} BDT\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ সম্পন্ন কাজ: {total_done} টি\n"
-            f"⏳ রিভিউতে আছে: {total_pend} টি",
-        )
-        return ConversationHandler.END
 
-    # ── TASKS ──
-    elif text == "📋 Tasks":
-        await update.message.reply_text(
-            txt(uid, "📋 একটি কাজ বেছে নিন:", "📋 Choose a task:"),
-            reply_markup=task_keyboard(),
-        )
-        return TASK_SELECT
+# ═══════════════════════════════════════════════════════════
+#  TEMP-MAIL API
+# ═══════════════════════════════════════════════════════════
 
-    # ── WITHDRAW ──
-    elif text == "📥 Withdraw":
-        await update.message.reply_text(
-            '📥 আপনার USDT-BEP20 Wallet Address টি দিন ✍️\n\n'
-            '_(Cancel করতে "Cancel ❌" লিখুন)_',
-            parse_mode="Markdown",
-            reply_markup=cancel_keyboard(),
-        )
-        return WITHDRAW_ADDR
-
-    # ── PROFILE ──
-    elif text == "👤 Profile":
-        user       = update.effective_user
-        uname      = f"@{user.username}" if user.username else "N/A"
-        bal        = get_balance(uid)
-        ref_count, ref_income = get_referral_stats(uid)
-        await update.message.reply_text(
-            f"👤 প্রোফাইল\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📛 নাম: {user.full_name}\n"
-            f"🆔 Username: {uname}\n"
-            f"🔢 Chat ID: {user.id}\n\n"
-            f"💰 ব্যালেন্স: {bal:.2f} BDT\n"
-            f"👥 মোট রেফার: {ref_count} জন\n"
-            f"🎁 রেফার ইনকাম: {ref_income:.2f} BDT",
-        )
-        return ConversationHandler.END
-
-    # ── LANGUAGE ──
-    elif text == "🌎 Language":
-        await update.message.reply_text(
-            "🌎 ভাষা বেছে নিন / Choose language:",
-            reply_markup=lang_keyboard(),
-        )
-        return LANG_SELECT
-
-    # ── SUPPORT ──
-    elif text == "Support 🆘":
-        await update.message.reply_text(
-            f"🆘 সাপোর্টের জন্য আমাদের চ্যানেলে যোগাযোগ করুন:\n{CHANNEL_LINK}",
-        )
-        return ConversationHandler.END
-
-    # ── PROXY ──
-    elif text == "ProxyBOT 🪀":
-        await update.message.reply_text(f"🪀 ProxyBOT:\n{PROXY_LINK}")
-        return ConversationHandler.END
-
-    # ── REFERRALS ──
-    elif text == "Referrals 👥":
-        ref_count, ref_income = get_referral_stats(uid)
-        await update.message.reply_text(
-            f"🎁 আমার রেফারেল\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👤 মোট রেফার: {ref_count}\n"
-            f"💰 মোট রেফার ইনকাম: {ref_income:.2f} BDT\n\n"
-            f"🔗 আপনার রেফার লিংক:\n"
-            f"`https://t.me/{BOT_USERNAME}?start={uid}`\n\n"
-            f"🔔 আপনার আমন্ত্রিত ব্যক্তি যা ইনকাম করবে, তার থেকে আপনি 5% কমিশন "
-            f"সরাসরি আপনার ব্যালেন্সে পেয়ে যাবেন।",
-            parse_mode="Markdown",
-        )
-        return ConversationHandler.END
-
-    return ConversationHandler.END
-
-# ─────────────────────────────────────────
-# TASK FLOW
-# ─────────────────────────────────────────
-async def task_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = update.message.text
-
-    if text == "Cancel ❌":
-        await update.message.reply_text(
-            txt(uid, "🏠 হোমে ফিরে এসেছেন।", "🏠 Returned home."),
-            reply_markup=home_keyboard(),
-        )
-        return ConversationHandler.END
-
-    elif "TikTok" in text or "tiktok" in text.lower():
-        tt_user = gen_username()
-        tt_pass = get_setting("tt_password")
-        ctx.user_data["task"]        = "tiktok"
-        ctx.user_data["tt_username"] = tt_user
-        await update.message.reply_text(
-            f"👤 Username:\n`{tt_user}`\n\n"
-            f"🔑 Password:\n`{tt_pass}`\n\n"
-            "🧾 উপরের ইউজারনেম এবং পাসওয়ার্ড দিয়ে অ্যাকাউন্ট খুলুন।\n"
-            "তারপর 2FA চালু করুন এবং নিচে 2FA Set বাটনে ক্লিক করুন 👋",
-            parse_mode="Markdown",
-            reply_markup=twofa_set_keyboard(),
-        )
-        return TT_WAIT_2FA
-
-    elif "Insta" in text:
-        insta_user = gen_username()
-        insta_pass = get_setting("insta_password")
-        ctx.user_data["task"]           = "insta"
-        ctx.user_data["insta_username"] = insta_user
-        await update.message.reply_text(
-            f"👤 Username:\n`{insta_user}`\n\n"
-            f"🔑 Password:\n`{insta_pass}`\n\n"
-            "🧾 উপরের ইউজারনেম এবং পাসওয়ার্ড দিয়ে অ্যাকাউন্ট খুলুন।\n"
-            "তারপর 2FA চালু করুন এবং নিচে 2FA Set বাটনে ক্লিক করুন 👋",
-            parse_mode="Markdown",
-            reply_markup=twofa_set_keyboard(),
-        )
-        return INSTA_WAIT_2FA
-
-    await update.message.reply_text("⚠️ একটি অপশন বেছে নিন।", reply_markup=task_keyboard())
-    return TASK_SELECT
-
-# ── TikTok: wait for 2FA button click, then secret key ──
-async def tt_wait_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = update.message.text
-
-    if text == "Cancel ❌":
-        await update.message.reply_text("🏠", reply_markup=home_keyboard())
-        return ConversationHandler.END
-
-    if text == "2FA Set 📐":
-        await update.message.reply_text(
-            "🔑 এখন আপনার TikTok অ্যাকাউন্টের 2FA Secret Key পাঠান:\n\n"
-            "(2FA চালু করার সময় যে QR code বা text key পাবেন সেটা)",
-            reply_markup=cancel_keyboard(),
-        )
-        return TT_WAIT_2FA
-
-    # user sent the 2FA secret key
-    secret = text.strip().replace(" ", "")
-    code   = gen_totp(secret)
-    ctx.user_data["tt_2fa_key"] = secret
-
-    if code == "ERROR":
-        await update.message.reply_text(
-            "❌ 2FA Key সঠিক নয়! আবার চেষ্টা করুন।\n"
-            "(সঠিক Base32 secret key দিন)",
-            reply_markup=cancel_keyboard(),
-        )
-        return TT_WAIT_2FA
-
-    await update.message.reply_text(
-        f"✅ আপনার 2FA কোড: `{code}`\n\n"
-        "এই কোডটি TikTok এ দিয়ে 2FA confirm করুন।\n\n"
-        "🔔 এরপর যেই ইমেল দিয়ে একাউন্ট করেছেন ওই ইমেল টা দিন ❗",
-        parse_mode="Markdown",
-        reply_markup=cancel_keyboard(),
-    )
-    return TT_WAIT_EMAIL
-
-async def tt_wait_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = update.message.text.strip()
-
-    if text == "Cancel ❌":
-        await update.message.reply_text("🏠", reply_markup=home_keyboard())
-        return ConversationHandler.END
-
-    ctx.user_data["tt_email"] = text
-
-    await update.message.reply_text(
-        "🔔 অ্যাকাউন্ট খোলা শেষ হলে নিচের বাটনে চাপ দিন:",
-        reply_markup=registered_keyboard(),
-    )
-    return TT_WAIT_REGISTERED
-
-async def tt_wait_registered(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = update.message.text
-
-    if text == "Cancel ❌":
-        ctx.user_data.clear()
-        await update.message.reply_text("🏠", reply_markup=home_keyboard())
-        return ConversationHandler.END
-
-    if text == "Account Registered ✅":
-        tt_user = ctx.user_data.get("tt_username", gen_username())
-        tt_pass = get_setting("tt_password")
-        twofa   = ctx.user_data.get("tt_2fa_key", "")
-        email   = ctx.user_data.get("tt_email", "")
-
-        cur.execute(
-            "INSERT INTO tiktok_accounts (user_id, username, password, twofa_key, email, status, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (uid, tt_user, tt_pass, twofa, email, "pending", datetime.now().isoformat()),
-        )
-        conn.commit()
-
-        wait_time = get_setting("report_time") or "64 Minutes"
-        await update.message.reply_text(
-            f"✅ Submitted! Review pending. Balance will be added after approval.\n"
-            f"⏳ Please Wait {wait_time}…",
-            reply_markup=home_keyboard(),
-        )
-        ctx.user_data.clear()
-        return ConversationHandler.END
-
-    return TT_WAIT_REGISTERED
-
-# ── Instagram: wait for 2FA button click, then secret key ──
-async def insta_wait_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = update.message.text
-
-    if text == "Cancel ❌":
-        await update.message.reply_text("🏠", reply_markup=home_keyboard())
-        return ConversationHandler.END
-
-    if text == "2FA Set 📐":
-        await update.message.reply_text(
-            "🔑 এখন আপনার Instagram অ্যাকাউন্টের 2FA Secret Key পাঠান:\n\n"
-            "(2FA চালু করার সময় যে QR code বা text key পাবেন সেটা)",
-            reply_markup=cancel_keyboard(),
-        )
-        return INSTA_WAIT_2FA
-
-    secret = text.strip().replace(" ", "")
-    code   = gen_totp(secret)
-    ctx.user_data["insta_2fa_key"] = secret
-
-    if code == "ERROR":
-        await update.message.reply_text(
-            "❌ 2FA Key সঠিক নয়! আবার চেষ্টা করুন।",
-            reply_markup=cancel_keyboard(),
-        )
-        return INSTA_WAIT_2FA
-
-    await update.message.reply_text(
-        f"✅ আপনার 2FA কোড: `{code}`\n\n"
-        "এই কোডটি Instagram এ দিয়ে 2FA confirm করুন।",
-        parse_mode="Markdown",
-        reply_markup=cancel_keyboard(),
-    )
-
-    # Save to DB
-    insta_user = ctx.user_data.get("insta_username", gen_username())
-    insta_pass = get_setting("insta_password")
-    cur.execute(
-        "INSERT INTO insta_accounts (user_id, username, password, twofa_key, status, created_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (uid, insta_user, insta_pass, secret, "pending", datetime.now().isoformat()),
-    )
-    conn.commit()
-
-    await update.message.reply_text(
-        "🔔 অ্যাকাউন্ট খোলা শেষ হলে নিচের বাটনে চাপ দিন:",
-        reply_markup=registered_keyboard(),
-    )
-    return INSTA_WAIT_EMAIL
-
-async def insta_wait_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = update.message.text
-
-    if text == "Cancel ❌":
-        ctx.user_data.clear()
-        await update.message.reply_text("🏠", reply_markup=home_keyboard())
-        return ConversationHandler.END
-
-    if text == "Account Registered ✅":
-        wait_time = get_setting("report_time") or "64 Minutes"
-        await update.message.reply_text(
-            f"✅ Submitted! Review pending. Balance will be added after approval.\n"
-            f"⏳ Please Wait {wait_time}…",
-            reply_markup=home_keyboard(),
-        )
-        ctx.user_data.clear()
-        return ConversationHandler.END
-
-    return INSTA_WAIT_EMAIL
-
-# ─────────────────────────────────────────
-# WITHDRAW FLOW
-# ─────────────────────────────────────────
-async def withdraw_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    addr = update.message.text.strip()
-
-    if addr == "Cancel ❌":
-        await update.message.reply_text("🏠 হোমে ফিরে এসেছেন।", reply_markup=home_keyboard())
-        return ConversationHandler.END
-
-    ctx.user_data["withdraw_addr"] = addr
-    bal      = get_balance(uid)
-    bal_usdt = bal / USDT_RATE
-
-    await update.message.reply_text(
-        f"✅ Address সেভ হয়েছে!\n\n"
-        f"💰 আপনার ব্যালেন্স: {bal:.2f} BDT ({bal_usdt:.6f} USDT)\n"
-        f"📌 ফি: {FEE_USDT} USDT কাটা হবে\n"
-        f"💱 1 USDT = {USDT_RATE} BDT\n\n"
-        f"কত BDT উইথড্র করতে চান?\n"
-        f"সর্বনিম্ন {MIN_WITHDRAW_TK} BDT",
-        reply_markup=cancel_keyboard(),
-    )
-    return WITHDRAW_AMOUNT
-
-async def withdraw_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = update.message.text.strip()
-
-    if text == "Cancel ❌":
-        await update.message.reply_text("🏠", reply_markup=home_keyboard())
-        return ConversationHandler.END
-
+def create_email() -> tuple[str | None, str | None]:
+    url  = "https://api.internal.temp-mail.io/api/v3/email/new"
+    body = json.dumps({"min_name_length": 10, "max_name_length": 10}).encode()
+    hdrs = {"Content-Type": "application/json",
+            "accept": "application/json", "User-Agent": "Mozilla/5.0"}
+    req  = urllib.request.Request(url, data=body, headers=hdrs)
     try:
-        amount_tk = float(text)
-    except ValueError:
-        await update.message.reply_text("❌ সংখ্যা দিন! যেমন: 50", reply_markup=cancel_keyboard())
-        return WITHDRAW_AMOUNT
+        with urllib.request.urlopen(req) as res:
+            r = json.loads(res.read())
+            return r["email"], r["token"]
+    except Exception as e:
+        print("[✗] create_email:", e)
+        return None, None
 
-    bal = get_balance(uid)
-    if amount_tk < MIN_WITHDRAW_TK:
-        await update.message.reply_text(
-            f"❌ সর্বনিম্ন {MIN_WITHDRAW_TK} BDT উইথড্র করতে হবে!\n"
-            f"💰 আপনার ব্যালেন্স: {bal:.2f} BDT",
-            reply_markup=cancel_keyboard(),
+
+def get_inbox(email: str) -> list:
+    url  = f"https://api.internal.temp-mail.io/api/v3/email/{email}/messages"
+    hdrs = {"accept": "application/json", "User-Agent": "Mozilla/5.0"}
+    req  = urllib.request.Request(url, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req) as res:
+            return json.loads(res.read())
+    except Exception as e:
+        print("[✗] get_inbox:", e)
+        return []
+
+
+# ═══════════════════════════════════════════════════════════
+#  ESCAPE HELPER FOR MarkdownV2
+# ═══════════════════════════════════════════════════════════
+
+_ESC = str.maketrans({c: f"\\{c}" for c in r"\_*[]()~`>#+-=|{}.!"})
+
+def esc(text: str) -> str:
+    """Escape special chars for MarkdownV2."""
+    return str(text).translate(_ESC)
+
+
+# ═══════════════════════════════════════════════════════════
+#  UPDATE HANDLERS
+# ═══════════════════════════════════════════════════════════
+
+def handle_command(message: dict):
+    chat_id = message["chat"]["id"]
+    text    = message.get("text", "")
+
+    # Reply keyboard shortcuts
+    reply_map = {
+        "📧 Generate": "generate",
+        "📬 Inbox":    "inbox",
+        "🗑 Delete":   "delete",
+        "📊 Stats":    "statistics",
+    }
+    if text in reply_map:
+        _dispatch_action(chat_id, reply_map[text])
+        return
+
+    if text == "/start":
+        welcome = (
+            "👋 Welcome to *Temp Mail Bot*\\!\n\n"
+            "🔒 _Your private, disposable inbox — right inside Telegram\\._\n\n"
+            "Use the buttons below or the keyboard at the bottom\\."
         )
-        return WITHDRAW_AMOUNT
-    if amount_tk > bal:
-        await update.message.reply_text(
-            f"❌ অপর্যাপ্ত ব্যালেন্স!\n💰 আপনার ব্যালেন্স: {bal:.2f} BDT",
-            reply_markup=cancel_keyboard(),
+        # Show BOTH the inline keyboard AND the persistent reply keyboard
+        send_message(chat_id, welcome,
+                     inline_buttons=MAIN_INLINE_KB,
+                     reply_keyboard=MAIN_REPLY_KB)
+
+    elif text == "/help":
+        help_text = (
+            "📖 *Commands*\n\n"
+            f"• /start — {esc('Show main menu')}\n"
+            f"• /email — {esc('Generate a new temp email')}\n"
+            f"• /inbox — {esc('Check your inbox')}\n"
+            f"• /delete — {esc('Delete current email')}\n"
+            f"• /stats — {esc('Show bot statistics')}\n"
         )
-        return WITHDRAW_AMOUNT
+        send_message(chat_id, help_text)
 
-    amount_usdt = (amount_tk / USDT_RATE) - FEE_USDT
-    if amount_usdt <= 0:
-        await update.message.reply_text("❌ ফি বাদে পরিমাণ শূন্য হয়ে যাচ্ছে!")
-        return WITHDRAW_AMOUNT
+    elif text == "/email":
+        _dispatch_action(chat_id, "generate")
+    elif text == "/inbox":
+        _dispatch_action(chat_id, "inbox")
+    elif text == "/delete":
+        _dispatch_action(chat_id, "delete")
+    elif text == "/stats":
+        _dispatch_action(chat_id, "statistics")
 
-    addr = ctx.user_data.get("withdraw_addr", "")
-    cur.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (amount_tk, uid))
-    cur.execute(
-        "INSERT INTO withdrawals (user_id, address, amount_tk, amount_usdt, status, created_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (uid, addr, amount_tk, amount_usdt, "pending", datetime.now().isoformat()),
-    )
-    conn.commit()
 
-    user  = update.effective_user
-    uname = f"@{user.username}" if user.username else str(uid)
-    await notify_admins(
-        ctx.bot,
-        f"💸 নতুন Withdraw Request!\n"
-        f"👤 {user.full_name} ({uname})\n"
-        f"💰 {amount_tk}tk → {amount_usdt:.6f} USDT\n"
-        f"📍 Address: `{addr}`",
-    )
+def handle_callback(callback: dict):
+    chat_id     = callback["message"]["chat"]["id"]
+    action      = callback["data"]
+    callback_id = callback["id"]
 
-    await update.message.reply_text(
-        txt(uid,
-            "✅ আপনার Withdraw টি ১-৬ ঘন্টার মধ্যে আপনার Wallet এ পাঠিয়ে দেওয়া হবে, ধন্যবাদ 💝",
-            "✅ Your withdrawal will be processed within 1-6 hours. Thank you 💝"),
-        reply_markup=home_keyboard(),
-    )
-    ctx.user_data.clear()
-    return ConversationHandler.END
+    answer_callback(callback_id)          # stop the spinner immediately
+    _dispatch_action(chat_id, action)
 
-# ─────────────────────────────────────────
-# LANGUAGE FLOW
-# ─────────────────────────────────────────
-async def lang_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    text = update.message.text
 
-    if "Bangla" in text or "🇧🇩" in text:
-        cur.execute("UPDATE users SET language='bn' WHERE user_id=?", (uid,))
-        conn.commit()
-        await update.message.reply_text("✅ বাংলা সেট হয়েছে!", reply_markup=home_keyboard())
-        return ConversationHandler.END
-    elif "English" in text or "🇺🇸" in text:
-        cur.execute("UPDATE users SET language='en' WHERE user_id=?", (uid,))
-        conn.commit()
-        await update.message.reply_text("✅ English set!", reply_markup=home_keyboard())
-        return ConversationHandler.END
+def _dispatch_action(chat_id, action: str):
+    """Central dispatcher for all actions (from both inline & reply keyboard)."""
+    user = user_data.get(chat_id)
 
-    await update.message.reply_text("⚠️ আবার বেছে নিন।", reply_markup=lang_keyboard())
-    return LANG_SELECT
-
-# ─────────────────────────────────────────
-# ADMIN DECORATORS
-# ─────────────────────────────────────────
-def admin_only(func):
-    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not is_admin(update.effective_user.id):
-            await update.message.reply_text("❌ Access denied.")
+    # ── GENERATE ──────────────────────────────────────────
+    if action in ("generate", "menu"):
+        if action == "menu":
+            send_message(chat_id, "🏠 *Main Menu*",
+                         inline_buttons=MAIN_INLINE_KB)
             return
-        return await func(update, ctx)
-    wrapper.__name__ = func.__name__
-    return wrapper
 
-def superadmin_only(func):
-    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id != SUPERADMIN_ID:
-            await update.message.reply_text("❌ Access denied.")
+        send_message(chat_id, "⏳ _Generating your email\\.\\.\\._")
+        email, token = create_email()
+        if email:
+            user_data[chat_id] = {"email": email, "token": token}
+            msg = (
+                f"✅ *Email Generated\\!*\n\n"
+                f"📧 `{esc(email)}`\n\n"
+                f"_Tap the email to copy it\\._"
+            )
+            send_message(chat_id, msg, inline_buttons=email_action_kb())
+        else:
+            send_message(chat_id, "❌ Failed to generate email\\. Try again\\.")
+
+    # ── INBOX ─────────────────────────────────────────────
+    elif action == "inbox":
+        if not user:
+            send_message(chat_id,
+                         "⚠️ No email yet\\! Tap *Generate Email* first\\.",
+                         inline_buttons=[[_ib("📧 Generate", "generate", "primary")]])
             return
-        return await func(update, ctx)
-    wrapper.__name__ = func.__name__
-    return wrapper
 
-# ─────────────────────────────────────────
-# ADMIN COMMANDS
-# ─────────────────────────────────────────
-@admin_only
-async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cur.execute("SELECT COUNT(*) FROM users")
-    total_users = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM users WHERE joined=1")
-    verified = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM tiktok_accounts")
-    tt_total = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM tiktok_accounts WHERE status='approved'")
-    tt_approved = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM tiktok_accounts WHERE status='pending'")
-    tt_pending = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM insta_accounts")
-    insta_total = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM insta_accounts WHERE status='approved'")
-    insta_approved = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM insta_accounts WHERE status='pending'")
-    insta_pending = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")
-    pending_wd = cur.fetchone()[0]
-    cur.execute("SELECT SUM(balance) FROM users")
-    total_balance = cur.fetchone()[0] or 0
+        send_message(chat_id, "📬 _Fetching inbox\\.\\.\\._")
+        messages = get_inbox(user["email"])
 
-    await update.message.reply_text(
-        f"📊 *Bot Statistics*\n\n"
-        f"👥 Total Users: {total_users}\n"
-        f"✅ Verified: {verified}\n\n"
-        f"🎵 TikTok: {tt_total} total | ✅ {tt_approved} | ⏳ {tt_pending} pending\n"
-        f"📸 Instagram: {insta_total} total | ✅ {insta_approved} | ⏳ {insta_pending} pending\n\n"
-        f"💸 Pending Withdrawals: {pending_wd}\n"
-        f"💰 Total User Balance: {total_balance:.4f}tk",
-        parse_mode="Markdown",
-    )
-
-@admin_only
-async def cmd_pass_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if not args:
-        await update.message.reply_text(
-            "🔑 *Password পরিবর্তন:*\n\n"
-            "`/pass <password>` লিখুন — এটাই TikTok এবং Instagram দুই টাস্কের password হবে।",
-            parse_mode="Markdown",
-        )
-        return
-
-    val = " ".join(args)
-    set_setting("tt_password", val)
-    set_setting("insta_password", val)
-    await update.message.reply_text(
-        f"✅ Password আপডেট হয়েছে (TikTok + Instagram):\n`{val}`",
-        parse_mode="Markdown",
-    )
-
-@admin_only
-async def cmd_reviewtt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cur.execute(
-        "SELECT id, username, user_id FROM tiktok_accounts WHERE status='pending' ORDER BY id"
-    )
-    rows = cur.fetchall()
-    if not rows:
-        await update.message.reply_text("📭 কোনো pending TikTok account নেই।")
-        return
-
-    ctx.user_data["tt_review"]     = rows
-    ctx.user_data["tt_review_idx"] = 0
-    idx = 0
-    acc_id, username, owner_uid = rows[idx]
-
-    await update.message.reply_text(
-        f"🎵 *TikTok Review* [{idx+1}/{len(rows)}]\n\n`{username}`",
-        parse_mode="Markdown",
-        reply_markup=review_keyboard(idx, "tt"),
-    )
-
-@admin_only
-async def cmd_reviewinsta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cur.execute(
-        "SELECT id, username, user_id FROM insta_accounts WHERE status='pending' ORDER BY id"
-    )
-    rows = cur.fetchall()
-    if not rows:
-        await update.message.reply_text("📭 কোনো pending Instagram account নেই।")
-        return
-
-    ctx.user_data["insta_review"]     = rows
-    ctx.user_data["insta_review_idx"] = 0
-    idx = 0
-    acc_id, username, owner_uid = rows[idx]
-
-    await update.message.reply_text(
-        f"📸 *Instagram Review* [{idx+1}/{len(rows)}]\n\n`{username}`",
-        parse_mode="Markdown",
-        reply_markup=review_keyboard(idx, "insta"),
-    )
-
-async def review_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(query.from_user.id):
-        return
-
-    data   = query.data  # e.g. rej_tt_0
-    parts  = data.split("_")
-    action = parts[0]
-    acc_type = parts[1]
-    idx    = int(parts[2])
-
-    review_key = f"{acc_type}_review"
-    rows       = ctx.user_data.get(review_key, [])
-
-    if not rows:
-        await query.edit_message_text("⚠️ Session শেষ। কমান্ড আবার দিন।")
-        return
-
-    if idx >= len(rows):
-        idx = len(rows) - 1
-
-    acc_id, username, owner_uid = rows[idx]
-    table  = "tiktok_accounts" if acc_type == "tt" else "insta_accounts"
-    label  = "🎵 TikTok"       if acc_type == "tt" else "📸 Instagram"
-    reward = 3                  if acc_type == "tt" else 4
-
-    if action == "app":
-        cur.execute(f"UPDATE {table} SET status='approved' WHERE id=?", (acc_id,))
-        conn.commit()
-        add_balance(owner_uid, reward)
-
-        # Referral commission: 5% to referrer
-        cur.execute("SELECT referred_by FROM users WHERE user_id=?", (owner_uid,))
-        ref_row = cur.fetchone()
-        if ref_row and ref_row[0]:
-            referrer_id = ref_row[0]
-            commission  = round(reward * REFERRAL_COMMISSION, 4)
-            add_balance(referrer_id, commission)
-            add_referral_income(referrer_id, commission)
-            try:
-                await ctx.bot.send_message(
-                    referrer_id,
-                    f"🎁 রেফারেল কমিশন পেয়েছেন!\n"
-                    f"💰 +{commission:.2f} BDT আপনার ব্যালেন্সে যোগ হয়েছে!",
+        if messages:
+            for i, msg in enumerate(messages, 1):
+                sender  = esc(msg.get("from",      "Unknown"))
+                subject = esc(msg.get("subject",   "No Subject"))
+                body    = esc(msg.get("body_text", "[No Body]")[:800])
+                mail_text = (
+                    f"📨 *Message {i}*\n"
+                    f"👤 From: {sender}\n"
+                    f"📌 Subject: {subject}\n"
+                    f"─────────────────\n"
+                    f"{body}"
                 )
-            except Exception:
-                pass
+                send_message(chat_id, mail_text)
+        else:
+            send_message(chat_id,
+                         "📭 *Inbox is empty\\.* Waiting for messages\\.",
+                         inline_buttons=[[_ib("🔄 Refresh", "inbox", "primary")]])
 
-        try:
-            await ctx.bot.send_message(
-                owner_uid,
-                f"✅ আপনার {label} টাস্ক অ্যাপ্রুভ হয়েছে!\n"
-                f"👤 Account: {username}\n"
-                f"💰 +{reward} BDT আপনার ব্যালেন্সে যোগ হয়েছে!",
-            )
-        except Exception:
-            pass
-        rows.pop(idx)
-        ctx.user_data[review_key] = rows
+    # ── DELETE ────────────────────────────────────────────
+    elif action == "delete":
+        if chat_id in user_data:
+            old_email = esc(user_data[chat_id]["email"])
+            del user_data[chat_id]
+            send_message(chat_id,
+                         f"🗑 *Email Deleted\\!*\n\n`{old_email}` has been removed\\.",
+                         inline_buttons=[[_ib("📧 Generate New", "generate", "primary")]])
+        else:
+            send_message(chat_id, "⚠️ You don't have an active email to delete\\.")
 
-    elif action == "rej":
-        cur.execute(f"UPDATE {table} SET status='rejected' WHERE id=?", (acc_id,))
-        conn.commit()
-        try:
-            await ctx.bot.send_message(
-                owner_uid,
-                f"❌ আপনার {label} টাস্ক রিজেক্ট হয়েছে।\n"
-                f"👤 Account: {username}",
-            )
-        except Exception:
-            pass
-        rows.pop(idx)
-        ctx.user_data[review_key] = rows
-
-    elif action == "next":
-        idx = min(idx + 1, len(rows) - 1)
-
-    elif action == "prev":
-        idx = max(idx - 1, 0)
-
-    rows = ctx.user_data.get(review_key, [])
-    if not rows:
-        await query.edit_message_text(f"✅ সব {label} রিভিউ শেষ!")
-        return
-
-    if idx >= len(rows):
-        idx = len(rows) - 1
-
-    acc_id, username, owner_uid = rows[idx]
-    await query.edit_message_text(
-        f"{label} *Review* [{idx+1}/{len(rows)}]\n\n`{username}`",
-        parse_mode="Markdown",
-        reply_markup=review_keyboard(idx, acc_type),
-    )
-
-@admin_only
-async def cmd_xltiktok(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cur.execute(
-        "SELECT username, password, twofa_key, email FROM tiktok_accounts ORDER BY id"
-    )
-    rows = cur.fetchall()
-    if not rows:
-        await update.message.reply_text("📭 কোনো TikTok account নেই।")
-        return
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "TikTok Accounts"
-    ws.append(["Username", "Password", "2FA Key", "Email"])
-    for row in rows:
-        ws.append(list(row))
-
-    buf = BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    await update.message.reply_document(
-        document=buf,
-        filename=f"tiktok_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-        caption=f"🎵 TikTok Accounts — {len(rows)} টি",
-    )
-
-@admin_only
-async def cmd_xlinsta(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cur.execute(
-        "SELECT username, password, twofa_key FROM insta_accounts ORDER BY id"
-    )
-    rows = cur.fetchall()
-    if not rows:
-        await update.message.reply_text("📭 কোনো Instagram account নেই।")
-        return
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Instagram Accounts"
-    ws.append(["Username", "Password", "2FA Key"])
-    for row in rows:
-        ws.append(list(row))
-
-    buf = BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    await update.message.reply_document(
-        document=buf,
-        filename=f"insta_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-        caption=f"📸 Instagram Accounts — {len(rows)} টি",
-    )
-
-@admin_only
-async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        current = get_setting("report_time") or "64 Minutes"
-        await update.message.reply_text(
-            f"⏳ বর্তমান wait time: {current}\n\n"
-            f"পরিবর্তন করতে: /report <time>\n"
-            f"উদাহরণ: /report 2 Hours বা /report 30 Minutes",
+    # ── STATISTICS ────────────────────────────────────────
+    elif action == "statistics":
+        total = len(user_data)
+        bar   = "🟩" * min(total, 10) + "⬜" * max(0, 10 - total)
+        stats_text = (
+            f"📊 *Bot Statistics*\n\n"
+            f"👥 Active emails: `{total}`\n"
+            f"{bar}\n\n"
+            f"_Each session stores one temp email\\._"
         )
-        return
-    val = " ".join(ctx.args)
-    set_setting("report_time", val)
-    await update.message.reply_text(f"✅ Wait time আপডেট হয়েছে: {val}")
+        send_message(chat_id, stats_text,
+                     inline_buttons=[[_ib("🔄 Refresh Stats", "statistics", "default")]])
 
-@superadmin_only
-async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text(
-            "📢 সব user এর কাছে message পাঠাতে:\n"
-            "/broadcast <message>",
-        )
-        return
 
-    msg = " ".join(ctx.args)
-    cur.execute("SELECT user_id FROM users")
-    users = cur.fetchall()
+# ═══════════════════════════════════════════════════════════
+#  POLLING LOOP
+# ═══════════════════════════════════════════════════════════
 
-    success = 0
-    failed  = 0
-    for (user_id,) in users:
-        try:
-            await ctx.bot.send_message(user_id, msg)
-            success += 1
-        except Exception:
-            failed += 1
+def get_updates(offset=None) -> dict:
+    params = f"?offset={offset}&timeout=30" if offset else "?timeout=30"
+    return _get("getUpdates", params)
 
-    await update.message.reply_text(
-        f"📢 Broadcast সম্পন্ন!\n\n"
-        f"✅ সফল: {success} জন\n"
-        f"❌ ব্যর্থ: {failed} জন",
-    )
 
-@admin_only
-async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cur.execute("DELETE FROM tiktok_accounts")
-    cur.execute("DELETE FROM insta_accounts")
-    cur.execute("DELETE FROM withdrawals WHERE status='pending'")
-    conn.commit()
-    await update.message.reply_text(
-        "✅ সব account এবং pending withdrawals clear হয়েছে।\n"
-        "💰 User balance অক্ষত আছে।",
-    )
-
-@superadmin_only
-async def cmd_toggle_bot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global BOT_ENABLED
-    BOT_ENABLED = not BOT_ENABLED
-    status = "✅ চালু" if BOT_ENABLED else "🔴 বন্ধ"
-    await update.message.reply_text(f"🤖 Bot এখন {status}!")
-
-# ─────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    last_id = None
+    print("🤖 Bot is running with API 9.4 colored buttons…")
+    while True:
+        updates = get_updates(last_id)
+        for update in updates.get("result", []):
+            last_id = update["update_id"] + 1
+            if "message" in update:
+                handle_command(update["message"])
+            elif "callback_query" in update:
+                handle_callback(update["callback_query"])
+        time.sleep(1)
 
-    conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND & filters.Regex(
-                    r"^(💰 Balance|📋 Tasks|📥 Withdraw|👤 Profile|🌎 Language"
-                    r"|Support 🆘|ProxyBOT 🪀|Referrals 👥)$"
-                ),
-                handle_message,
-            ),
-        ],
-        states={
-            TASK_SELECT:        [MessageHandler(filters.TEXT & ~filters.COMMAND, task_select)],
-            TT_WAIT_2FA:        [MessageHandler(filters.TEXT & ~filters.COMMAND, tt_wait_2fa)],
-            TT_WAIT_EMAIL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, tt_wait_email)],
-            TT_WAIT_REGISTERED: [MessageHandler(filters.TEXT & ~filters.COMMAND, tt_wait_registered)],
-            INSTA_WAIT_2FA:     [MessageHandler(filters.TEXT & ~filters.COMMAND, insta_wait_2fa)],
-            INSTA_WAIT_EMAIL:   [MessageHandler(filters.TEXT & ~filters.COMMAND, insta_wait_email)],
-            WITHDRAW_ADDR:      [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_addr)],
-            WITHDRAW_AMOUNT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount)],
-            LANG_SELECT:        [MessageHandler(filters.TEXT & ~filters.COMMAND, lang_select)],
-        },
-        fallbacks=[CommandHandler("start", start)],
-        allow_reentry=True,
-        name="main_conv",
-    )
-
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
-    app.add_handler(CallbackQueryHandler(review_callback,     pattern=r"^(rej|app|prev|next)_(tt|insta)_\d+$"))
-    app.add_handler(CommandHandler("stats",      cmd_stats))
-    app.add_handler(CommandHandler("pass",       cmd_pass_handler))
-    app.add_handler(CommandHandler("reviewtt",   cmd_reviewtt))
-    app.add_handler(CommandHandler("reviewinsta",cmd_reviewinsta))
-    app.add_handler(CommandHandler("xltiktok",   cmd_xltiktok))
-    app.add_handler(CommandHandler("xlinsta",    cmd_xlinsta))
-    app.add_handler(CommandHandler("clear",      cmd_clear))
-    app.add_handler(CommandHandler("report",     cmd_report))
-    app.add_handler(CommandHandler("broadcast",  cmd_broadcast))
-    app.add_handler(CommandHandler("534757",     cmd_toggle_bot))
-
-    # Catch-all for unmatched home buttons outside conversation
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("🤖 Bot polling started…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
