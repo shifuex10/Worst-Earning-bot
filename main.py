@@ -23,7 +23,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 CHANNEL_ID = "@worst_bux_bot"
 CHANNEL_LINK = "https://t.me/worst_bux_bot"
 PROXY_LINK = "https://t.me/will_be_eran_shop_bot?start=ref_8907284640"
-BOT_USERNAME = "Future_incomejx_bot"
+BOT_USERNAME = "WORST_EARN_BOT"
 
 SUPERADMIN_ID = 8452827743
 ADMIN_1 = int(os.environ.get("ADMIN_1", "0"))
