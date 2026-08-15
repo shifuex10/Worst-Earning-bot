@@ -480,8 +480,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 মোট রেফার: {ref_count}\n"
             f"💰 মোট রেফার ইনকাম: {ref_income:.2f} BDT\n\n"
-            f"🔗 আপনার রেফার লিংক:\n{ref_link}\n\n"
-            f"🔔 আপনার আমন্ত্রিত ব্যক্তি যা ইনকাম করবে, তার থেকে আপনি 5% কমিশন সরাসরি আপনার ব্যালেন্সে পেয়ে যাবেন।"
+            f"🔗 আপনার রেফার লিংক:\n"
+            f"`https://t.me/{BOT_USERNAME}?start={uid}`\n\n"
+            f"🔔 আপনার আমন্ত্রিত ব্যক্তি যা ইনকাম করবে, তার থেকে আপনি 5% কমিশন সরাসরি আপনার ব্যালেন্সে পেয়ে যাবেন।",
+            parse_mode="Markdown"
         )
         return ConversationHandler.END
 
