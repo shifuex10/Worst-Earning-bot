@@ -3,5 +3,7 @@
 #   - json        (built-in)
 #   - urllib      (built-in)
 #   - time        (built-in)
+#   - os          (built-in)
+#   - sys         (built-in)
 #
-# Python >= 3.10 recommended (for `dict | None` union type hints)
+# Python >= 3.10 recommended

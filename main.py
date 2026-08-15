@@ -1,26 +1,30 @@
 import json
+import os
+import sys
 import urllib.request
 import urllib.error
 import time
 
 # ─────────────────────────────────────────
-#  CONFIG
+#  CONFIG — Railway environment variable
 # ─────────────────────────────────────────
-BOT_TOKEN  = "7785587052:AAEMYlsJE3baNFDasQfsXVdlJPcRR82t40Q"
-API_URL    = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# ── API 9.4: button colors via entity-style text ──────────────────────────────
-# Telegram Bot API 9.4 introduced `text_color` and `background_color` (hex)
-# inside InlineKeyboardButton for bots. We use them on every button below.
-# ─────────────────────────────────────────
+if not BOT_TOKEN:
+    print("[✗] ERROR: BOT_TOKEN environment variable is not set!")
+    print("    → Railway dashboard → Variables → Add BOT_TOKEN")
+    sys.exit(1)
+
+API_URL   = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 user_data: dict = {}
+
+print(f"[✓] BOT_TOKEN loaded from environment.")
 
 # ═══════════════════════════════════════════════════════════
 #  LOW-LEVEL HTTP HELPERS
 # ═══════════════════════════════════════════════════════════
 
 def _post(endpoint: str, payload: dict) -> dict | None:
-    """Send a POST request to the Telegram Bot API."""
     url     = API_URL + endpoint
     data    = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
@@ -29,14 +33,14 @@ def _post(endpoint: str, payload: dict) -> dict | None:
         with urllib.request.urlopen(req) as res:
             return json.loads(res.read())
     except urllib.error.HTTPError as e:
-        print(f"[✗] HTTP {e.code}: {e.reason}")
+        body = e.read().decode()
+        print(f"[✗] HTTP {e.code}: {e.reason} → {body}")
     except Exception as e:
         print(f"[✗] Request error: {e}")
     return None
 
 
 def _get(endpoint: str, params: str = "") -> dict:
-    """Send a GET request to the Telegram Bot API."""
     url = API_URL + endpoint + params
     try:
         with urllib.request.urlopen(url) as res:
@@ -57,35 +61,30 @@ def send_message(
     reply_keyboard=None,
     remove_keyboard: bool = False,
 ):
-    """
-    Unified send_message that supports:
-      • inline_keyboard  – list[list[dict]]  (InlineKeyboardButton rows)
-      • reply_keyboard   – list[list[dict]]  (ReplyKeyboardButton rows)
-      • remove_keyboard  – bool              (hides the reply keyboard)
-    """
     payload = {
         "chat_id":    chat_id,
         "text":       text,
-        "parse_mode": "MarkdownV2",   # MarkdownV2 is recommended in API 9.x
+        "parse_mode": "MarkdownV2",
     }
 
     if inline_buttons:
         payload["reply_markup"] = {"inline_keyboard": inline_buttons}
     elif reply_keyboard:
         payload["reply_markup"] = {
-            "keyboard":          reply_keyboard,
-            "resize_keyboard":   True,
-            "one_time_keyboard": False,
+            "keyboard":                reply_keyboard,
+            "resize_keyboard":         True,
+            "one_time_keyboard":       False,
             "input_field_placeholder": "Choose an option…",
         }
     elif remove_keyboard:
         payload["reply_markup"] = {"remove_keyboard": True}
 
-    _post("sendMessage", payload)
+    result = _post("sendMessage", payload)
+    if result and not result.get("ok"):
+        print(f"[✗] sendMessage failed: {result.get('description')}")
 
 
 def answer_callback(callback_id: str, text: str = "", alert: bool = False):
-    """Acknowledge a callback query (stops the loading spinner)."""
     _post("answerCallbackQuery", {
         "callback_query_id": callback_id,
         "text":              text,
@@ -96,28 +95,18 @@ def answer_callback(callback_id: str, text: str = "", alert: bool = False):
 # ═══════════════════════════════════════════════════════════
 #  BUTTON FACTORIES  (API 9.4 colored InlineKeyboardButton)
 # ═══════════════════════════════════════════════════════════
-#
-# API 9.4 adds optional fields to InlineKeyboardButton:
-#   • "color"  → one of "default" | "primary" | "destructive"
-#                (maps to the client's accent / blue / red palette)
-#
-# We also keep emoji prefixes for clients that don't render colors yet.
 
 def _ib(text: str, cb: str, color: str = "default") -> dict:
-    """Shorthand: colored Inline Button."""
     return {"text": text, "callback_data": cb, "color": color}
 
 
-# ── Main menu inline keyboard ──────────────────────────────────────────────────
 MAIN_INLINE_KB = [
-    [_ib("📧  Generate Email",  "generate",   color="primary")],
-    [_ib("📬  Inbox",           "inbox",      color="default")],
-    [_ib("🗑  Delete Email",    "delete",     color="destructive")],
-    [_ib("📊  Statistics",      "statistics", color="default")],
+    [_ib("📧  Generate Email", "generate",   color="primary")],
+    [_ib("📬  Inbox",          "inbox",      color="default")],
+    [_ib("🗑  Delete Email",   "delete",     color="destructive")],
+    [_ib("📊  Statistics",     "statistics", color="default")],
 ]
 
-# ── Persistent Reply Keyboard (always visible at bottom) ──────────────────────
-#  ReplyKeyboardButton supports `color` too in API 9.4 via the same field.
 MAIN_REPLY_KB = [
     [{"text": "📧 Generate", "color": "primary"},
      {"text": "📬 Inbox",    "color": "default"}],
@@ -125,13 +114,12 @@ MAIN_REPLY_KB = [
      {"text": "📊 Stats",    "color": "default"}],
 ]
 
-# ── Per-email inline keyboard (shown after email is generated) ─────────────────
 def email_action_kb() -> list:
     return [
-        [_ib("📬  Check Inbox",   "inbox",  color="primary"),
-         _ib("🔄  Regenerate",    "generate", color="default")],
-        [_ib("🗑  Delete Email",  "delete", color="destructive")],
-        [_ib("🏠  Back to Menu",  "menu",   color="default")],
+        [_ib("📬  Check Inbox",  "inbox",    color="primary"),
+         _ib("🔄  Regenerate",   "generate", color="default")],
+        [_ib("🗑  Delete Email", "delete",   color="destructive")],
+        [_ib("🏠  Back to Menu", "menu",     color="default")],
     ]
 
 
@@ -173,7 +161,6 @@ def get_inbox(email: str) -> list:
 _ESC = str.maketrans({c: f"\\{c}" for c in r"\_*[]()~`>#+-=|{}.!"})
 
 def esc(text: str) -> str:
-    """Escape special chars for MarkdownV2."""
     return str(text).translate(_ESC)
 
 
@@ -185,7 +172,6 @@ def handle_command(message: dict):
     chat_id = message["chat"]["id"]
     text    = message.get("text", "")
 
-    # Reply keyboard shortcuts
     reply_map = {
         "📧 Generate": "generate",
         "📬 Inbox":    "inbox",
@@ -202,7 +188,6 @@ def handle_command(message: dict):
             "🔒 _Your private, disposable inbox — right inside Telegram\\._\n\n"
             "Use the buttons below or the keyboard at the bottom\\."
         )
-        # Show BOTH the inline keyboard AND the persistent reply keyboard
         send_message(chat_id, welcome,
                      inline_buttons=MAIN_INLINE_KB,
                      reply_keyboard=MAIN_REPLY_KB)
@@ -233,21 +218,17 @@ def handle_callback(callback: dict):
     action      = callback["data"]
     callback_id = callback["id"]
 
-    answer_callback(callback_id)          # stop the spinner immediately
+    answer_callback(callback_id)
     _dispatch_action(chat_id, action)
 
 
 def _dispatch_action(chat_id, action: str):
-    """Central dispatcher for all actions (from both inline & reply keyboard)."""
     user = user_data.get(chat_id)
 
-    # ── GENERATE ──────────────────────────────────────────
-    if action in ("generate", "menu"):
-        if action == "menu":
-            send_message(chat_id, "🏠 *Main Menu*",
-                         inline_buttons=MAIN_INLINE_KB)
-            return
+    if action == "menu":
+        send_message(chat_id, "🏠 *Main Menu*", inline_buttons=MAIN_INLINE_KB)
 
+    elif action == "generate":
         send_message(chat_id, "⏳ _Generating your email\\.\\.\\._")
         email, token = create_email()
         if email:
@@ -261,17 +242,14 @@ def _dispatch_action(chat_id, action: str):
         else:
             send_message(chat_id, "❌ Failed to generate email\\. Try again\\.")
 
-    # ── INBOX ─────────────────────────────────────────────
     elif action == "inbox":
         if not user:
             send_message(chat_id,
                          "⚠️ No email yet\\! Tap *Generate Email* first\\.",
                          inline_buttons=[[_ib("📧 Generate", "generate", "primary")]])
             return
-
         send_message(chat_id, "📬 _Fetching inbox\\.\\.\\._")
         messages = get_inbox(user["email"])
-
         if messages:
             for i, msg in enumerate(messages, 1):
                 sender  = esc(msg.get("from",      "Unknown"))
@@ -290,7 +268,6 @@ def _dispatch_action(chat_id, action: str):
                          "📭 *Inbox is empty\\.* Waiting for messages\\.",
                          inline_buttons=[[_ib("🔄 Refresh", "inbox", "primary")]])
 
-    # ── DELETE ────────────────────────────────────────────
     elif action == "delete":
         if chat_id in user_data:
             old_email = esc(user_data[chat_id]["email"])
@@ -301,7 +278,6 @@ def _dispatch_action(chat_id, action: str):
         else:
             send_message(chat_id, "⚠️ You don't have an active email to delete\\.")
 
-    # ── STATISTICS ────────────────────────────────────────
     elif action == "statistics":
         total = len(user_data)
         bar   = "🟩" * min(total, 10) + "⬜" * max(0, 10 - total)
@@ -326,15 +302,19 @@ def get_updates(offset=None) -> dict:
 
 def main():
     last_id = None
-    print("🤖 Bot is running with API 9.4 colored buttons…")
+    print("🤖 Bot is running…")
     while True:
-        updates = get_updates(last_id)
-        for update in updates.get("result", []):
-            last_id = update["update_id"] + 1
-            if "message" in update:
-                handle_command(update["message"])
-            elif "callback_query" in update:
-                handle_callback(update["callback_query"])
+        try:
+            updates = get_updates(last_id)
+            for update in updates.get("result", []):
+                last_id = update["update_id"] + 1
+                if "message" in update:
+                    handle_command(update["message"])
+                elif "callback_query" in update:
+                    handle_callback(update["callback_query"])
+        except Exception as e:
+            print(f"[✗] Main loop error: {e}")
+            time.sleep(5)  # wait before retry on crash
         time.sleep(1)
 
 
