@@ -23,6 +23,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 CHANNEL_ID = "@worst_bux_bot"
 CHANNEL_LINK = "https://t.me/worst_bux_bot"
 PROXY_LINK = "https://t.me/will_be_eran_shop_bot?start=ref_8907284640"
+BOT_USERNAME = "Future_incomejx_bot"
 
 SUPERADMIN_ID = 8452827743
 ADMIN_1 = int(os.environ.get("ADMIN_1", "0"))
@@ -69,7 +70,8 @@ CREATE TABLE IF NOT EXISTS users (
     full_name TEXT,
     balance REAL DEFAULT 0.0,
     language TEXT DEFAULT 'bn',
-    joined INTEGER DEFAULT 0
+    joined INTEGER DEFAULT 0,
+    referred_by INTEGER DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tiktok_accounts (
@@ -149,6 +151,27 @@ def get_lang(user_id):
 def txt(user_id, bn, en):
     return bn if get_lang(user_id) == "bn" else en
 
+REFERRAL_COMMISSION = 0.05  # 5%
+
+def get_referral_stats(user_id):
+    cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (user_id,))
+    count = cur.fetchone()[0]
+    # total commission earned = sum of all rewards earned by referred users * 5%
+    # We track it in bot_settings as "ref_income_{user_id}"
+    cur.execute("SELECT value FROM bot_settings WHERE key=?", (f"ref_income_{user_id}",))
+    row = cur.fetchone()
+    income = float(row[0]) if row else 0.0
+    return count, income
+
+def add_referral_income(referrer_id, commission):
+    key = f"ref_income_{referrer_id}"
+    cur.execute("SELECT value FROM bot_settings WHERE key=?", (key,))
+    row = cur.fetchone()
+    current = float(row[0]) if row else 0.0
+    cur.execute("INSERT OR REPLACE INTO bot_settings (key,value) VALUES (?,?)",
+                (key, str(current + commission)))
+    conn.commit()
+
 def gen_totp(secret):
     try:
         secret = secret.strip().upper().replace(" ", "")
@@ -203,12 +226,18 @@ def home_keyboard():
         [_kb("📥 Withdraw", "danger"), _kb("👤 Profile", "primary")],
         [_kb("🌎 Language", "primary")],
         [_kb("Support 🆘", "danger"), _kb("ProxyBOT 🪀", "success")],
+        [_kb("Referrals 👥", "primary")],
+    ], resize_keyboard=True)
+
+def cancel_keyboard():
+    return ReplyKeyboardMarkup([
+        [_kb("Cancel ❌", "danger")],
     ], resize_keyboard=True)
 
 def task_keyboard():
     return ReplyKeyboardMarkup([
-        [_kb("TikTok 2Fa ( 3tk - 64 Minutes ⏰ )", "primary")],
-        [_kb("Insta 2Fa ( 4tk - 64 Minutes ⏰ )", "success")],
+        [_kb("TikTok 2Fa ( 3 BDT )", "primary")],
+        [_kb("Insta 2Fa ( 4 BDT )", "success")],
         [_kb("Cancel ❌", "danger")],
     ], resize_keyboard=True)
 
@@ -221,11 +250,6 @@ def twofa_set_keyboard():
 def registered_keyboard():
     return ReplyKeyboardMarkup([
         [_kb("Account Registered ✅", "success")],
-        [_kb("Cancel ❌", "danger")],
-    ], resize_keyboard=True)
-
-def cancel_keyboard():
-    return ReplyKeyboardMarkup([
         [_kb("Cancel ❌", "danger")],
     ], resize_keyboard=True)
 
@@ -273,6 +297,19 @@ def is_admin(user_id):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user)
+
+    # Handle referral: /start <referrer_uid>
+    if ctx.args:
+        try:
+            referrer_id = int(ctx.args[0])
+            if referrer_id != user.id:
+                cur.execute(
+                    "UPDATE users SET referred_by=? WHERE user_id=? AND referred_by IS NULL",
+                    (referrer_id, user.id)
+                )
+                conn.commit()
+        except (ValueError, TypeError):
+            pass
 
     uname = f"@{user.username}" if user.username else str(user.id)
     full_name = user.full_name or "Unknown"
@@ -358,7 +395,24 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── BALANCE ──
     if text == "💰 Balance":
         bal = get_balance(uid)
-        await update.message.reply_text(f"💰 {bal:.4f}tk")
+        cur.execute("SELECT COUNT(*) FROM tiktok_accounts WHERE user_id=? AND status='approved'", (uid,))
+        tt_done = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM insta_accounts WHERE user_id=? AND status='approved'", (uid,))
+        insta_done = cur.fetchone()[0]
+        total_done = tt_done + insta_done
+        cur.execute("SELECT COUNT(*) FROM tiktok_accounts WHERE user_id=? AND status='pending'", (uid,))
+        tt_pend = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM insta_accounts WHERE user_id=? AND status='pending'", (uid,))
+        insta_pend = cur.fetchone()[0]
+        total_pend = tt_pend + insta_pend
+        await update.message.reply_text(
+            f"👤 আপনার অ্যাকাউন্ট ব্যালেন্স:\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 ব্যালেন্স: {bal:.2f} BDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ সম্পন্ন কাজ: {total_done} টি\n"
+            f"⏳ রিভিউতে আছে: {total_pend} টি"
+        )
         return ConversationHandler.END
 
     # ── TASKS ──
@@ -371,17 +425,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── WITHDRAW ──
     elif text == "📥 Withdraw":
-        bal = get_balance(uid)
-        if bal < MIN_WITHDRAW_TK:
-            await update.message.reply_text(
-                txt(uid,
-                    f"❌ উইথড্র করতে কমপক্ষে {MIN_WITHDRAW_TK}tk লাগবে।\n💰 আপনার ব্যালেন্স: {bal:.4f}tk",
-                    f"❌ Minimum {MIN_WITHDRAW_TK}tk required.\n💰 Your balance: {bal:.4f}tk")
-            )
-            return ConversationHandler.END
         await update.message.reply_text(
-            'Sir, Please Enter Your "USDT-BEP20" Address ✍️',
-            reply_markup=ReplyKeyboardRemove()
+            '📥 আপনার USDT-BEP20 Wallet Address টি দিন ✍️\n\n'
+            '_(Cancel করতে "Cancel ❌" লিখুন)_',
+            parse_mode="Markdown",
+            reply_markup=cancel_keyboard()
         )
         return WITHDRAW_ADDR
 
@@ -390,12 +438,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         uname = f"@{user.username}" if user.username else "N/A"
         bal = get_balance(uid)
+        ref_count, ref_income = get_referral_stats(uid)
         await update.message.reply_text(
-            f"👤 প্রোফাইল\n\n"
+            f"👤 প্রোফাইল\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📛 নাম: {user.full_name}\n"
             f"🆔 Username: {uname}\n"
-            f"🔢 Chat ID: {user.id}\n"
-            f"💰 Balance: {bal:.4f}tk"
+            f"🔢 Chat ID: {user.id}\n\n"
+            f"💰 ব্যালেন্স: {bal:.2f} BDT\n"
+            f"👥 মোট রেফার: {ref_count} জন\n"
+            f"🎁 রেফার ইনকাম: {ref_income:.2f} BDT"
         )
         return ConversationHandler.END
 
@@ -419,6 +471,20 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🪀 ProxyBOT:\n{PROXY_LINK}")
         return ConversationHandler.END
 
+    # ── REFERRALS ──
+    elif text == "Referrals 👥":
+        ref_count, ref_income = get_referral_stats(uid)
+        ref_link = f"https://t.me/{BOT_USERNAME}?start={uid}"
+        await update.message.reply_text(
+            f"🎁 আমার রেফারেল\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 মোট রেফার: {ref_count}\n"
+            f"💰 মোট রেফার ইনকাম: {ref_income:.2f} BDT\n\n"
+            f"🔗 আপনার রেফার লিংক:\n{ref_link}\n\n"
+            f"🔔 আপনার আমন্ত্রিত ব্যক্তি যা ইনকাম করবে, তার থেকে আপনি 5% কমিশন সরাসরি আপনার ব্যালেন্সে পেয়ে যাবেন।"
+        )
+        return ConversationHandler.END
+
     return ConversationHandler.END
 
 # ─────────────────────────────────────────
@@ -435,7 +501,7 @@ async def task_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    elif "TikTok" in text:
+    elif "TikTok" in text or "tiktok" in text.lower():
         tt_user = gen_username()
         tt_pass = get_setting("tt_password")
         ctx.user_data["task"] = "tiktok"
@@ -509,8 +575,7 @@ async def tt_wait_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if text == "Cancel ❌":
-        ctx.user_data.clear()
-        await update.message.reply_text("🏠 হোমে ফিরে এসেছেন।", reply_markup=home_keyboard())
+        await update.message.reply_text("🏠", reply_markup=home_keyboard())
         return ConversationHandler.END
 
     ctx.user_data["tt_email"] = text
@@ -544,9 +609,7 @@ async def tt_wait_registered(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         conn.commit()
 
         await update.message.reply_text(
-            txt(uid,
-                "✅ সাবমিট হয়েছে! রিভিউ পেন্ডিং। অ্যাপ্রুভ হলে টাকা যোগ হবে।",
-                "✅ Submitted! Review pending. Balance will be added after approval."),
+            "✅ Submitted! Review pending. Balance will be added after approval. Please Wait 64 Minutes.. ⏳",
             reply_markup=home_keyboard()
         )
         ctx.user_data.clear()
@@ -615,9 +678,7 @@ async def insta_wait_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if text == "Account Registered ✅":
         await update.message.reply_text(
-            txt(uid,
-                "✅ সাবমিট হয়েছে! রিভিউ পেন্ডিং। অ্যাপ্রুভ হলে টাকা যোগ হবে।",
-                "✅ Submitted! Review pending. Balance will be added after approval."),
+            "✅ Submitted! Review pending. Balance will be added after approval. Please Wait 64 Minutes.. ⏳",
             reply_markup=home_keyboard()
         )
         ctx.user_data.clear()
@@ -633,7 +694,7 @@ async def withdraw_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addr = update.message.text.strip()
 
     if addr == "Cancel ❌":
-        await update.message.reply_text("🏠", reply_markup=home_keyboard())
+        await update.message.reply_text("🏠 হোমে ফিরে এসেছেন।", reply_markup=home_keyboard())
         return ConversationHandler.END
 
     ctx.user_data["withdraw_addr"] = addr
@@ -641,11 +702,13 @@ async def withdraw_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bal_usdt = bal / USDT_RATE
 
     await update.message.reply_text(
-        f"💰 আপনার ব্যালেন্স: *{bal:.4f}tk* ({bal_usdt:.6f} USDT)\n"
+        f"✅ Address সেভ হয়েছে!\n\n"
+        f"💰 আপনার ব্যালেন্স: {bal:.2f} BDT ({bal_usdt:.6f} USDT)\n"
         f"📌 ফি: {FEE_USDT} USDT কাটা হবে\n"
-        f"💱 1 USDT = {USDT_RATE}tk\n\n"
-        f"কত টাকা উইথড্র করতে চান?\n_(সর্বনিম্ন {MIN_WITHDRAW_TK}tk)_",
-        parse_mode="Markdown"
+        f"💱 1 USDT = {USDT_RATE} BDT\n\n"
+        f"কত BDT উইথড্র করতে চান?\n"
+        f"সর্বনিম্ন {MIN_WITHDRAW_TK} BDT",
+        reply_markup=cancel_keyboard()
     )
     return WITHDRAW_AMOUNT
 
@@ -660,15 +723,22 @@ async def withdraw_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         amount_tk = float(text)
     except ValueError:
-        await update.message.reply_text("❌ সংখ্যা দিন! যেমন: 50")
+        await update.message.reply_text("❌ সংখ্যা দিন! যেমন: 50", reply_markup=cancel_keyboard())
         return WITHDRAW_AMOUNT
 
     bal = get_balance(uid)
     if amount_tk < MIN_WITHDRAW_TK:
-        await update.message.reply_text(f"❌ সর্বনিম্ন {MIN_WITHDRAW_TK}tk!")
+        await update.message.reply_text(
+            f"❌ সর্বনিম্ন {MIN_WITHDRAW_TK} BDT উইথড্র করতে হবে!\n"
+            f"💰 আপনার ব্যালেন্স: {bal:.2f} BDT",
+            reply_markup=cancel_keyboard()
+        )
         return WITHDRAW_AMOUNT
     if amount_tk > bal:
-        await update.message.reply_text(f"❌ অপর্যাপ্ত ব্যালেন্স! আপনার: {bal:.4f}tk")
+        await update.message.reply_text(
+            f"❌ অপর্যাপ্ত ব্যালেন্স!\n💰 আপনার ব্যালেন্স: {bal:.2f} BDT",
+            reply_markup=cancel_keyboard()
+        )
         return WITHDRAW_AMOUNT
 
     amount_usdt = (amount_tk / USDT_RATE) - FEE_USDT
@@ -876,13 +946,30 @@ async def review_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cur.execute(f"UPDATE {table} SET status='approved' WHERE id=?", (acc_id,))
         conn.commit()
         add_balance(owner_uid, reward)
+
+        # Referral commission: 5% to referrer
+        cur.execute("SELECT referred_by FROM users WHERE user_id=?", (owner_uid,))
+        ref_row = cur.fetchone()
+        if ref_row and ref_row[0]:
+            referrer_id = ref_row[0]
+            commission = round(reward * REFERRAL_COMMISSION, 4)
+            add_balance(referrer_id, commission)
+            add_referral_income(referrer_id, commission)
+            try:
+                await ctx.bot.send_message(
+                    referrer_id,
+                    f"🎁 রেফারেল কমিশন পেয়েছেন!\n"
+                    f"💰 +{commission:.2f} BDT আপনার ব্যালেন্সে যোগ হয়েছে!"
+                )
+            except Exception:
+                pass
+
         try:
             await ctx.bot.send_message(
                 owner_uid,
                 f"✅ আপনার {label} টাস্ক অ্যাপ্রুভ হয়েছে!\n"
-                f"👤 Account: `{username}`\n"
-                f"💰 +{reward}tk আপনার ব্যালেন্সে যোগ হয়েছে!",
-                parse_mode="Markdown"
+                f"👤 Account: {username}\n"
+                f"💰 +{reward} BDT আপনার ব্যালেন্সে যোগ হয়েছে!"
             )
         except Exception:
             pass
@@ -896,8 +983,7 @@ async def review_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.send_message(
                 owner_uid,
                 f"❌ আপনার {label} টাস্ক রিজেক্ট হয়েছে।\n"
-                f"👤 Account: `{username}`",
-                parse_mode="Markdown"
+                f"👤 Account: {username}"
             )
         except Exception:
             pass
@@ -1006,7 +1092,7 @@ def main():
             CommandHandler("start", start),
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND & filters.Regex(
-                    "^(💰 Balance|📋 Tasks|📥 Withdraw|👤 Profile|🌎 Language|Support 🆘|ProxyBOT 🪀)$"
+                    "^(💰 Balance|📋 Tasks|📥 Withdraw|👤 Profile|🌎 Language|Support 🆘|ProxyBOT 🪀|Referrals 👥)$"
                 ),
                 handle_message
             ),
