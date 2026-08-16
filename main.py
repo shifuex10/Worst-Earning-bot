@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import time
+import threading
 import urllib.request
 import urllib.error
 
@@ -10,17 +11,18 @@ import urllib.error
 #  CONFIG
 # ─────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
 if not BOT_TOKEN:
-    print("[✗] ERROR: BOT_TOKEN environment variable not set!")
+    print("[✗] BOT_TOKEN not set!")
     sys.exit(1)
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
-# chat_id → {"email": str, "token": str}
+# chat_id → {"email": str, "seen_ids": set}
 user_data: dict = {}
+user_lock = threading.Lock()
 
 print("[✓] BOT_TOKEN loaded.")
+
 
 # ═══════════════════════════════════════════════════════
 #  HTTP HELPERS
@@ -35,63 +37,44 @@ def _post(endpoint: str, payload: dict) -> dict | None:
         with urllib.request.urlopen(req, timeout=15) as res:
             return json.loads(res.read())
     except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        print(f"[✗] HTTP {e.code}: {e.reason} → {body}")
+        print(f"[✗] HTTP {e.code}: {e.read().decode()}")
     except Exception as e:
         print(f"[✗] POST error: {e}")
     return None
 
 
-def _get(endpoint: str, params: str = "") -> dict:
-    url = API_URL + endpoint + params
+def _get_url(url: str, timeout: int = 10) -> dict | list | None:
     try:
-        with urllib.request.urlopen(url, timeout=30) as res:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0",
+                                                    "accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as res:
             return json.loads(res.read())
     except Exception as e:
         print(f"[✗] GET error: {e}")
-        return {}
+        return None
 
 
 # ═══════════════════════════════════════════════════════
-#  SEND HELPERS
+#  TELEGRAM SEND
 # ═══════════════════════════════════════════════════════
 
-def send_message(chat_id, text: str, reply_keyboard=None):
+MAIN_KB = {
+    "keyboard": [[{"text": "📬 Generate Mail"}]],
+    "resize_keyboard": True,
+    "one_time_keyboard": False,
+    "input_field_placeholder": "Tap Generate Mail…",
+}
+
+def send(chat_id, text: str) -> None:
     payload = {
-        "chat_id":    chat_id,
-        "text":       text,
-        "parse_mode": "MarkdownV2",
+        "chat_id":      chat_id,
+        "text":         text,
+        "parse_mode":   "HTML",
+        "reply_markup": MAIN_KB,
     }
-    if reply_keyboard is not None:
-        payload["reply_markup"] = {
-            "keyboard":          reply_keyboard,
-            "resize_keyboard":   True,
-            "one_time_keyboard": False,
-        }
-
-    result = _post("sendMessage", payload)
-    if result and not result.get("ok"):
-        print(f"[✗] sendMessage failed: {result.get('description')}")
-    return result
-
-
-# ═══════════════════════════════════════════════════════
-#  REPLY KEYBOARD  (persistent bottom keyboard)
-# ═══════════════════════════════════════════════════════
-
-MAIN_KB = [
-    [{"text": "📬 Generate Mail"}],
-]
-
-
-# ═══════════════════════════════════════════════════════
-#  MARKDOWNV2 ESCAPE
-# ═══════════════════════════════════════════════════════
-
-_ESC = str.maketrans({c: f"\\{c}" for c in r"\_*[]()~`>#+-=|{}.!"})
-
-def esc(text: str) -> str:
-    return str(text).translate(_ESC)
+    r = _post("sendMessage", payload)
+    if r and not r.get("ok"):
+        print(f"[✗] sendMessage: {r.get('description')}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -101,12 +84,9 @@ def esc(text: str) -> str:
 def create_email() -> tuple[str | None, str | None]:
     url  = "https://api.internal.temp-mail.io/api/v3/email/new"
     body = json.dumps({"min_name_length": 10, "max_name_length": 10}).encode()
-    hdrs = {
-        "Content-Type": "application/json",
-        "accept":       "application/json",
-        "User-Agent":   "Mozilla/5.0",
-    }
-    req = urllib.request.Request(url, data=body, headers=hdrs)
+    hdrs = {"Content-Type": "application/json",
+            "accept": "application/json", "User-Agent": "Mozilla/5.0"}
+    req  = urllib.request.Request(url, data=body, headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=10) as res:
             r = json.loads(res.read())
@@ -117,125 +97,129 @@ def create_email() -> tuple[str | None, str | None]:
 
 
 def get_inbox(email: str) -> list:
-    url  = f"https://api.internal.temp-mail.io/api/v3/email/{email}/messages"
-    hdrs = {"accept": "application/json", "User-Agent": "Mozilla/5.0"}
-    req  = urllib.request.Request(url, headers=hdrs)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as res:
-            return json.loads(res.read())
-    except Exception as e:
-        print("[✗] get_inbox:", e)
-        return []
+    url = f"https://api.internal.temp-mail.io/api/v3/email/{email}/messages"
+    r   = _get_url(url)
+    return r if isinstance(r, list) else []
 
 
 # ═══════════════════════════════════════════════════════
 #  OTP EXTRACTOR
 # ═══════════════════════════════════════════════════════
 
+OTP_RE = [
+    r"(?:otp|code|pin|passcode|verification[\s_-]?code|confirm(?:ation)?[\s_-]?code"
+    r"|security[\s_-]?code|auth(?:entication)?[\s_-]?code"
+    r"|one[\s_-]?time[\s_-]?(?:password|code))"
+    r"[\s:：\-–—]+([0-9]{4,8})",
+    r"is\s+([0-9]{5,8})\b",
+    r"\b([0-9]{6})\b",
+    r"\b([0-9]{4,8})\b",
+]
+
 def extract_otp(text: str) -> str | None:
-    patterns = [
-        r"(?:otp|code|verification\s*code|confirm\s*code|one[- ]?time)[^\d]{0,30}(\d{4,8})",
-        r"(\d{4,8})\s*(?:is your|as your|—|:)\s*(?:otp|code|password|pin)",
-        r"\b(\d{6})\b",
-        r"\b(\d{4,8})\b",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1)
+    if not text:
+        return None
+    lower = text.lower()
+    for pat in OTP_RE:
+        m = re.search(pat, lower)
+        if m:
+            return m.group(1)
     return None
 
 
 # ═══════════════════════════════════════════════════════
-#  INBOX POLLER
+#  INBOX WATCHER  (runs in background thread per user)
 # ═══════════════════════════════════════════════════════
 
-def poll_and_notify(chat_id, email: str, max_wait: int = 90, interval: int = 5):
-    seen_ids: set = set()
-    deadline = time.time() + max_wait
+def watch_inbox(chat_id: int, email: str, seen_ids: set):
+    """
+    Polls inbox every 5 sec forever.
+    Stops automatically when user generates a new email
+    (user_data[chat_id]["email"] no longer matches this email).
+    """
+    print(f"[→] Watching inbox for {email}")
+    while True:
+        time.sleep(5)
 
-    existing = get_inbox(email)
-    for m in existing:
-        seen_ids.add(m.get("id") or m.get("_id") or str(m))
-
-    while time.time() < deadline:
-        current = user_data.get(chat_id, {})
+        # Stop if user switched to a new email
+        with user_lock:
+            current = user_data.get(chat_id, {})
         if current.get("email") != email:
-            print(f"[i] Stopped polling {email} — user switched email.")
+            print(f"[←] Stopped watching {email}")
             return
 
-        time.sleep(interval)
-        messages = get_inbox(email)
+        try:
+            messages = get_inbox(email)
+        except Exception:
+            continue
 
         for msg in messages:
             msg_id = msg.get("id") or msg.get("_id") or str(msg)
             if msg_id in seen_ids:
                 continue
-
             seen_ids.add(msg_id)
 
-            if user_data.get(chat_id, {}).get("email") != email:
-                return
-
-            body    = msg.get("body_text") or msg.get("body_html") or ""
-            subject = msg.get("subject", "")
-            full    = f"{subject} {body}"
-
-            otp = extract_otp(full)
+            body    = msg.get("body_text", "") or ""
+            subject = msg.get("subject", "")   or ""
+            otp     = extract_otp(subject + "\n" + body)
 
             if otp:
                 text = (
-                    f"🔰 *Your OTP Received*\n\n"
-                    f"📧 Email: `{esc(email)}`\n"
-                    f"🔑 OTP: `{esc(otp)}`"
+                    "🔰 <b>Your OTP Received</b>\n\n"
+                    f"📧 Email: <code>{email}</code>\n"
+                    f"🔑 OTP: <code>{otp}</code>"
                 )
             else:
-                preview = esc(body[:200].strip()) if body else esc(subject)
                 text = (
-                    f"📨 *New Mail Received*\n\n"
-                    f"📧 Email: `{esc(email)}`\n"
-                    f"📌 Subject: {esc(subject)}\n\n"
-                    f"{preview}"
+                    "📨 <b>New Mail Received</b>\n\n"
+                    f"📧 Email: <code>{email}</code>\n"
+                    "⚠️ No OTP/code found in this email."
                 )
-
-            send_message(chat_id, text, reply_keyboard=MAIN_KB)
-            return
-
-    print(f"[i] Polling timeout for {email}")
+            send(chat_id, text)
 
 
 # ═══════════════════════════════════════════════════════
-#  ACTION: GENERATE MAIL
+#  ACTIONS
 # ═══════════════════════════════════════════════════════
 
-def action_generate(chat_id):
-    # Delete old email from memory — old mails won't be delivered anymore
-    if chat_id in user_data:
-        del user_data[chat_id]
+def action_start(chat_id: int):
+    send(chat_id,
+         "👋 <b>Welcome to Temp Mail Bot!</b>\n\n"
+         "🔒 Get a disposable inbox instantly.\n"
+         "🔑 OTP codes are auto-extracted and sent to you.\n"
+         "🔄 Generate new mail anytime — old mail is replaced.\n\n"
+         "👇 Tap <b>📬 Generate Mail</b> to start!")
 
-    send_message(chat_id, "⏳ _Generating your email\\.\\.\\._", reply_keyboard=MAIN_KB)
 
+def action_generate(chat_id: int):
+    send(chat_id, "⏳ Generating your email…")
     email, token = create_email()
+
     if not email:
-        send_message(
-            chat_id,
-            "❌ Failed to generate email\\. Please try again\\.",
-            reply_keyboard=MAIN_KB,
-        )
+        send(chat_id, "❌ Failed to generate email. Please try again.")
         return
 
-    user_data[chat_id] = {"email": email, "token": token}
+    seen_ids: set = set()
 
-    msg = (
-        f"✅ *New Email Generated\\!*\n\n"
-        f"📧 `{esc(email)}`\n\n"
-        f"_Tap the address above to copy it\\._\n"
-        f"⏳ _Waiting for mail \\(90 sec\\)\\.\\.\\._"
-    )
-    send_message(chat_id, msg, reply_keyboard=MAIN_KB)
+    # Save immediately — old watcher thread will detect change and stop
+    with user_lock:
+        # Pre-load existing inbox so we don't re-notify old mails
+        existing = get_inbox(email)
+        for m in existing:
+            seen_ids.add(m.get("id") or m.get("_id") or str(m))
 
-    # Block-poll for incoming messages
-    poll_and_notify(chat_id, email)
+        user_data[chat_id] = {"email": email, "token": token}
+
+    send(chat_id,
+         f"✅ <b>Email Generated!</b>\n\n"
+         f"📧 <code>{email}</code>\n\n"
+         "👆 Tap to copy. Watching for incoming mail…")
+
+    # Start background watcher thread
+    t = threading.Thread(target=watch_inbox,
+                         args=(chat_id, email, seen_ids),
+                         daemon=True)
+    t.start()
 
 
 # ═══════════════════════════════════════════════════════
@@ -247,67 +231,61 @@ def handle_message(message: dict):
     text    = message.get("text", "").strip()
 
     if text == "/start":
-        welcome = (
-            "👋 *Welcome to Temp Mail Bot\\!*\n\n"
-            "📬 Get a disposable email instantly\\.\n"
-            "🔑 OTP codes are auto\\-extracted \\& sent to you\\.\n"
-            "🔄 Generate new mail anytime — old mail is deleted automatically\\.\n\n"
-            "Press the button below to get started\\! 👇"
-        )
-        send_message(chat_id, welcome, reply_keyboard=MAIN_KB)
-
+        action_start(chat_id)
     elif text == "📬 Generate Mail":
         action_generate(chat_id)
-
-    else:
-        send_message(
-            chat_id,
-            "👇 Press *📬 Generate Mail* to get a temp email\\.",
-            reply_keyboard=MAIN_KB,
-        )
+    # ignore everything else silently
 
 
 # ═══════════════════════════════════════════════════════
-#  POLLING LOOP
+#  SKIP OLD UPDATES ON STARTUP
 # ═══════════════════════════════════════════════════════
 
-def get_updates(offset=None) -> dict:
-    params = f"?offset={offset}&timeout=30" if offset else "?timeout=30"
-    return _get("getUpdates", params)
-
-
-def skip_old_updates() -> int | None:
-    """On startup, skip all pending updates. Returns next offset."""
-    print("[i] Skipping old pending updates…")
+def skip_pending() -> int | None:
     try:
         url = API_URL + "getUpdates?offset=-1&timeout=0"
         with urllib.request.urlopen(url, timeout=10) as res:
             data = json.loads(res.read())
         results = data.get("result", [])
         if results:
-            last_id = results[-1]["update_id"] + 1
-            print(f"[i] Skipped to update_id offset={last_id}")
-            return last_id
+            offset = results[-1]["update_id"] + 1
+            print(f"[i] Skipped old updates. Starting from offset={offset}")
+            return offset
     except Exception as e:
-        print(f"[✗] skip_old_updates error: {e}")
+        print(f"[✗] skip_pending: {e}")
     return None
 
 
+# ═══════════════════════════════════════════════════════
+#  MAIN POLLING LOOP
+# ═══════════════════════════════════════════════════════
+
 def main():
     print("🤖 Bot is running…")
-    last_id = skip_old_updates()   # ← skip পুরনো সব messages
+    last_id = skip_pending()
 
     while True:
         try:
-            updates = get_updates(last_id)
-            for update in updates.get("result", []):
+            params = f"?offset={last_id}&timeout=30" if last_id else "?timeout=30"
+            url    = API_URL + "getUpdates" + params
+            data   = _get_url(url, timeout=35)
+
+            if not data:
+                continue
+
+            for update in data.get("result", []):
                 last_id = update["update_id"] + 1
                 if "message" in update:
-                    handle_message(update["message"])
+                    # Handle each message in its own thread → never blocks polling
+                    threading.Thread(
+                        target=handle_message,
+                        args=(update["message"],),
+                        daemon=True,
+                    ).start()
+
         except Exception as e:
             print(f"[✗] Main loop error: {e}")
-            time.sleep(5)
-        time.sleep(0)
+            time.sleep(3)
 
 
 if __name__ == "__main__":
