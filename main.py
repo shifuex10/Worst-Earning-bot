@@ -276,9 +276,27 @@ def get_updates(offset=None) -> dict:
     return _get("getUpdates", params)
 
 
+def skip_old_updates() -> int | None:
+    """On startup, skip all pending updates. Returns next offset."""
+    print("[i] Skipping old pending updates…")
+    try:
+        url = API_URL + "getUpdates?offset=-1&timeout=0"
+        with urllib.request.urlopen(url, timeout=10) as res:
+            data = json.loads(res.read())
+        results = data.get("result", [])
+        if results:
+            last_id = results[-1]["update_id"] + 1
+            print(f"[i] Skipped to update_id offset={last_id}")
+            return last_id
+    except Exception as e:
+        print(f"[✗] skip_old_updates error: {e}")
+    return None
+
+
 def main():
-    last_id = None
     print("🤖 Bot is running…")
+    last_id = skip_old_updates()   # ← skip পুরনো সব messages
+
     while True:
         try:
             updates = get_updates(last_id)
@@ -289,7 +307,7 @@ def main():
         except Exception as e:
             print(f"[✗] Main loop error: {e}")
             time.sleep(5)
-        time.sleep(1)
+        time.sleep(0)
 
 
 if __name__ == "__main__":
