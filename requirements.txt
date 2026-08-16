@@ -1,9 +1,4 @@
 # No third-party packages required.
 # This bot uses only Python standard library modules:
-#   - json        (built-in)
-#   - urllib      (built-in)
-#   - time        (built-in)
-#   - os          (built-in)
-#   - sys         (built-in)
-#
-# Python >= 3.10 recommended
+#   - urllib.request / urllib.error  (HTTP calls)
+#   - json, re, os, sys, time
